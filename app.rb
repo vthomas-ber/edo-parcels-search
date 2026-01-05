@@ -18,12 +18,49 @@ EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 # --- THE LOGIC CLASS (The Hunter) ---
 class ImageHunter
   def initialize
-    @country_names = {
-      "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
-      "UK" => "UK United Kingdom", "GB" => "UK United Kingdom", "FR" => "France",
-      "IT" => "Italia Italy", "ES" => "España Spain", "PL" => "Polska Poland",
-      "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique Belgium",
-      "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal"
+@country_names = {
+      # Germany (German + English)
+      "DE" => "Deutschland Germany",
+      
+      # Austria (German + English)
+      "AT" => "Österreich Austria",
+      
+      # Switzerland (German + French + Italian + English)
+      "CH" => "Schweiz Suisse Svizzera Switzerland",
+      
+      # UK (English)
+      "UK" => "UK United Kingdom",
+      "GB" => "UK United Kingdom",
+      
+      # France (French)
+      "FR" => "France",
+      
+      # Italy (Italian)
+      "IT" => "Italia Italy",
+      
+      # Spain (Spanish)
+      "ES" => "España Spain",
+      
+      # Poland (Polish)
+      "PL" => "Polska Poland",
+      
+      # Denmark (Danish)
+      "DK" => "Danmark Denmark",
+      
+      # Netherlands (Dutch)
+      "NL" => "Nederland Netherlands",
+      
+      # Belgium (French + Dutch/Flemish + English) <--- UPDATED THIS
+      "BE" => "Belgique België Belgium",
+      
+      # Sweden (Swedish)
+      "SE" => "Sverige Sweden",
+      
+      # Norway (Norwegian)
+      "NO" => "Norge Norway",
+      
+      # Portugal (Portuguese)
+      "PT" => "Portugal"
     }
     @country_langs = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
