@@ -21,19 +21,16 @@ class ImageHunter
       "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal"
     }
     
-    # Map Markets to Google Language Codes (hl)
     @country_langs = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
       "FR" => "fr", "BE" => "fr", "IT" => "it", "ES" => "es", "PL" => "pl",
       "DK" => "da", "NL" => "nl", "SE" => "sv", "NO" => "no", "PT" => "pt"
     }
     
-    # NEW: Localized Search Keywords
-    # We use these to force Google to find data in the correct language
     @local_keywords = {
       "DE" => "Zutaten Nährwerte", "AT" => "Zutaten Nährwerte", "CH" => "Zutaten Nährwerte",
       "UK" => "Ingredients Nutrition", "GB" => "Ingredients Nutrition",
-      "FR" => "Ingrédients Nutrition", "BE" => "Ingrédients Nutrition", # French default for BE
+      "FR" => "Ingrédients Nutrition", "BE" => "Ingrédients Nutrition",
       "NL" => "Ingrediënten Voedingswaarden", 
       "IT" => "Ingredienti Nutrizionali",
       "ES" => "Ingredientes Nutrición",
@@ -44,7 +41,6 @@ class ImageHunter
       "PT" => "Ingredientes Nutrição"
     }
 
-    # The Team Trusted Sources
     @data_sources = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:courses.monoprix.fr OR site:labellevie.com OR site:chronodrive.com OR site:intermarche.com OR site:houra.fr OR site:bamcourses.com OR site:franprix.fr OR site:clic-shopping.com OR site:willyantigaspi.fr OR site:beansclub.fr",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:groceries.morrisons.com OR site:iceland.co.uk OR site:aldi.co.uk OR site:poundland.co.uk OR site:marksandspencer.com OR site:amazon.co.uk OR site:bmstores.co.uk OR site:heronfoods.com OR site:poundstretcher.co.uk OR site:home.bargains OR site:therange.co.uk OR site:lowpricefoods.com OR site:approvedfood.co.uk OR site:discountdragon.co.uk OR site:productlibrary.brandbank.com OR site:nutricircle.co.uk",
@@ -67,7 +63,7 @@ class ImageHunter
     # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
     
-    # 2. DATA HUNT (Multilingual Sniper)
+    # 2. DATA HUNT (Strict Local Language)
     data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
     # 3. MERGE
@@ -77,7 +73,6 @@ class ImageHunter
 
   # --- PART 1: VISUAL HUNTER ---
   def hunt_visuals(gtin, market, country_name, lang_code)
-    # A. Check EAN-Search API
     if EAN_SEARCH_TOKEN
       api_data = check_ean_api(gtin) 
       if api_data && is_good?(api_data[:image])
@@ -90,7 +85,6 @@ class ImageHunter
       end
     end
 
-    # B. Google Images Strategies
     site_res = search_google_images("site:barcodelookup.com \"#{gtin}\"", market, lang_code)
     return site_res if site_res
 
@@ -103,41 +97,73 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER (Multilingual Strategy) ---
+  # --- PART 2: DATA HUNTER (Updated with Gem Logic) ---
   def hunt_data(gtin, market, lang_code, product_name)
     return empty_data_set unless SERPAPI_KEY
-
-    # Get the local words for "Ingredients" and "Nutrition"
     keywords = @local_keywords[market] || "Ingredients Nutrition"
 
-    # 1. THE GOLDMINE SEARCH (Trusted Sites + Local Keywords)
+    # RULE 1: STRICT EXCLUSION
+    # We append this to ALL searches to ban OpenFoodFacts and other generic wikis
+    bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
+
+    # STRATEGY 1: GOOGLE SHOPPING
+    shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
+    return shopping_data unless shopping_data[:ingredients] == "-"
+
+    # STRATEGY 2: SNIPER SEARCH (Goldmine)
     goldmine = @data_sources[market]
     if goldmine
-      puts "   👉 Sniper Search in #{market}: #{goldmine}"
-      # We append the keywords so Google highlights the ingredient list in the snippet
-      data = run_text_search("#{goldmine} #{gtin} #{keywords}", market, lang_code)
+      puts "   👉 Sniper Search: #{goldmine}"
+      data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
     
-    # 2. THE BRAND SEARCH (Fallback)
+    # STRATEGY 3: BRAND SEARCH
     if product_name
-      puts "   👉 Name Search: #{product_name} #{keywords}"
-      data = run_text_search("#{product_name} #{keywords}", market, lang_code)
+      puts "   👉 Name Search: #{product_name}"
+      data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
     
-    # 3. THE BROAD SEARCH (Last Resort)
-    puts "   👉 Broad Search: #{gtin} #{keywords}"
-    return run_text_search("#{gtin} #{keywords}", market, lang_code)
+    return empty_data_set
+  end
+
+  def run_shopping_search(query, market, lang_code)
+    begin
+      search = GoogleSearch.new(
+        q: query, 
+        tbm: "shop", 
+        gl: market.downcase, 
+        hl: lang_code, 
+        lr: "lang_#{lang_code}", # <--- NEW: Forces results in local language only
+        api_key: SERPAPI_KEY
+      )
+      res = search.get_hash
+      
+      big_text_blob = ""
+      (res[:shopping_results] || []).first(3).each do |item|
+        big_text_blob += " " + (item[:title] || "") + " " + (item[:snippet] || "") + " " + (item[:description] || "")
+      end
+      
+      return extract_all_data(big_text_blob)
+    rescue
+      return empty_data_set
+    end
   end
 
   def run_text_search(query, market, lang_code)
     begin
-      search = GoogleSearch.new(q: query, gl: market.downcase, hl: lang_code, api_key: SERPAPI_KEY)
+      search = GoogleSearch.new(
+        q: query, 
+        gl: market.downcase, 
+        hl: lang_code, 
+        lr: "lang_#{lang_code}", # <--- NEW: Forces results in local language only
+        api_key: SERPAPI_KEY
+      )
       res = search.get_hash
       
       big_text_blob = ""
-      (res[:organic_results] || []).first(5).each do |item|
+      (res[:organic_results] || []).first(6).each do |item|
         big_text_blob += " " + (item[:snippet] || "")
       end
       
@@ -150,32 +176,28 @@ class ImageHunter
   def extract_all_data(text_blob)
     text_blob = text_blob.gsub(/\s+/, " ")
 
-    # EXPANDED MULTILINGUAL REGEX
-    # Matches: Ingredients (EN), Zutaten (DE), Ingrédients (FR), Ingrediënten (NL), 
-    # Ingredienser (DK/SE/NO), Ingredientes (ES/PT), Ingredienti (IT), Składniki (PL)
-    ing_regex = /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.]\s*(.*?)(?=(nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
+    ing_regex = /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
     
-    # Matches: Nutrition Headers
     nutri_regex = /(per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
 
-    # Matches: Allergens
-    allergen_regex = /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
+    allergen_regex = /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
+
+    may_regex = /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(\.|nutrition|voedings|$))/i
 
     data = {
-      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
+      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)\s*[:\.-]?\s*(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
       ingredients: extract_text(text_blob, ing_regex),
       allergens: extract_text(text_blob, allergen_regex),
-      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
+      may_contain: extract_text(text_blob, may_regex),
       nutrition_header: extract_text(text_blob, nutri_regex),
-      
       energy: extract_text(text_blob, /(energy|energie|valeur|valor|energi|energia).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|grassi|fedt|tłuszcz|$))/i),
-      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|dont|di cui|de las|varav|heraf|w tym|$))/i),
-      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone).*?(\d+[,\.]?\d*\s?g?)/i),
-      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|dont|zuccheri|sukker|cukry|$))/i),
-      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)\s*(\d+[,\.]?\d*\s?g?)/i),
-      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)\s*(\d+[,\.]?\d*\s?g?)/i),
-      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)\s*(\d+[,\.]?\d*\s?g?)/i),
-      salt: extract_text(text_blob, /(salt|salz|zout|sel|sale|sal|sól)\s*(\d+[,\.]?\d*\s?g?)/i),
+      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|dont|di cui|de las|varav|heraf|w tym|$))/i),
+      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone).*?([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
+      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|dont|zuccheri|sukker|cukry|$))/i),
+      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
+      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
+      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
+      salt: extract_text(text_blob, /(salt|salz|zout|sel|sale|sal|sól)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
       organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
     }
     return data
@@ -309,6 +331,7 @@ __END__
       <thead>
         <tr>
           <th>GTIN</th>
+          <th>Product Name</th>
           <th>Status</th>
           <th>Image</th>
           <th>Weight</th>
@@ -354,7 +377,7 @@ __END__
     for (const gtin of lines) {
       document.getElementById('statusText').innerText = `Hunting ${gtin} (${processed + 1}/${lines.length})...`;
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<16; i++) { emptyCells += "<td></td>"; }
+      let emptyCells = ""; for(let i=0; i<17; i++) { emptyCells += "<td></td>"; }
       tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Loading...</td>` + emptyCells;
       tbody.appendChild(tr);
 
@@ -364,6 +387,7 @@ __END__
         
         tr.innerHTML = `
           <td>${gtin}</td>
+          <td>${(data.product_name || '-').substring(0,30)}...</td>
           <td class="${data.found ? 'status-found' : 'status-missing'}">${data.found ? 'Found' : 'Missing'}</td>
           <td>${data.url ? `<img src="${data.url}" class="img-preview">` : '❌'}</td>
           <td>${data.weight}</td>
@@ -394,10 +418,10 @@ __END__
   }
 
   function downloadCSV() {
-    let csv = "GTIN,Market,Status,ImageURL,SourceURL,Weight,Ingredients,Allergens,MayContain,NutritionHeader,Energy,Fat,Saturates,Carbohydrates,Sugars,Protein,Fiber,Salt,OrganicID\n";
+    let csv = "GTIN,ProductName,Market,Status,ImageURL,SourceURL,Weight,Ingredients,Allergens,MayContain,NutritionHeader,Energy,Fat,Saturates,Carbohydrates,Sugars,Protein,Fiber,Salt,OrganicID\n";
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
-      csv += `${row.gtin},${row.market},${row.status},${row.url},${row.source},${clean(row.weight)},${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},${clean(row.nutrition_header)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},${clean(row.salt)},${clean(row.organic_cert)}\n`;
+      csv += `${row.gtin},${clean(row.product_name)},${row.market},${row.status},${row.url},${row.source},${clean(row.weight)},${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},${clean(row.nutrition_header)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},${clean(row.salt)},${clean(row.organic_cert)}\n`;
     });
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
