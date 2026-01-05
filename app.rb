@@ -11,56 +11,18 @@ set :bind, '0.0.0.0'
 set :port, 8080
 
 # --- API KEYS ---
-# It looks for keys in the Cloud Environment variables by their NAME, not their value.
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
-# --- THE LOGIC CLASS (The Hunter) ---
+# --- THE LOGIC CLASS ---
 class ImageHunter
   def initialize
-@country_names = {
-      # Germany (German + English)
-      "DE" => "Deutschland Germany",
-      
-      # Austria (German + English)
-      "AT" => "Österreich Austria",
-      
-      # Switzerland (German + French + Italian + English)
-      "CH" => "Schweiz Suisse Svizzera Switzerland",
-      
-      # UK (English)
-      "UK" => "UK United Kingdom",
-      "GB" => "UK United Kingdom",
-      
-      # France (French)
-      "FR" => "France",
-      
-      # Italy (Italian)
-      "IT" => "Italia Italy",
-      
-      # Spain (Spanish)
-      "ES" => "España Spain",
-      
-      # Poland (Polish)
-      "PL" => "Polska Poland",
-      
-      # Denmark (Danish)
-      "DK" => "Danmark Denmark",
-      
-      # Netherlands (Dutch)
-      "NL" => "Nederland Netherlands",
-      
-      # Belgium (French + Dutch/Flemish + English) <--- UPDATED THIS
-      "BE" => "Belgique België Belgium",
-      
-      # Sweden (Swedish)
-      "SE" => "Sverige Sweden",
-      
-      # Norway (Norwegian)
-      "NO" => "Norge Norway",
-      
-      # Portugal (Portuguese)
-      "PT" => "Portugal"
+    @country_names = {
+      "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
+      "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
+      "IT" => "Italia Italy", "ES" => "España Spain", "PL" => "Polska Poland",
+      "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique België Belgium",
+      "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal"
     }
     @country_langs = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
@@ -75,23 +37,42 @@ class ImageHunter
     country_name = @country_names[market] || ""
     lang_code = @country_langs[market] || "en"
     
-    # 1. Check EAN-Search API (Fastest)
+    product_name = nil
+
+    # --- ATTEMPT 1: CHECK DATABASE (EAN-Search) ---
     if EAN_SEARCH_TOKEN
-      api_img = check_ean_api(gtin)
-      return api_img if api_img
+      # We now ask for BOTH the image AND the name
+      api_data = check_ean_api(gtin) 
+      if api_data
+        # If they have a good photo, use it!
+        return api_data[:image] if is_good?(api_data[:image])
+        # If not, SAVE THE NAME for later
+        product_name = api_data[:name]
+      end
     end
 
-    # 2. Check BarcodeLookup via Google (Targeted)
+    # --- ATTEMPT 2: TARGETED SITE SEARCH ---
+    # Search specific barcode sites via Google
     site_img = search_google("site:barcodelookup.com \"#{gtin}\"", market, lang_code)
     return site_img if site_img
 
-    # 3. Strict Country Search (Localized)
+    # --- ATTEMPT 3: STRICT GOOGLE SEARCH (Number + Country) ---
     strict_img = search_google("\"#{gtin}\" #{country_name}", market, lang_code)
     return strict_img if strict_img
 
-    # 4. Broad Search (Fallback)
+    # --- ATTEMPT 4: BROAD GOOGLE SEARCH (Number Only) ---
     broad_img = search_google("\"#{gtin}\"", market, lang_code)
     return broad_img if broad_img
+
+    # --- ATTEMPT 5: NAME SEARCH (The Translator Strategy) ---
+    # If we found a name in Attempt 1 but no photo, use the name now!
+    if product_name
+      # Remove generic words to clean up the search
+      clean_name = product_name.gsub(/[^a-zA-Z0-9\s]/, '') 
+      puts "   👉 Attempt 5: Searching by Name ('#{clean_name}')..."
+      name_img = search_google(clean_name, market, lang_code)
+      return name_img if name_img
+    end
 
     return nil
   end
@@ -102,14 +83,19 @@ class ImageHunter
     data = JSON.parse(response) rescue []
     product = data.first
     return nil unless product
-    img = product["image"]
-    return (img && is_good?(img)) ? img : nil
+    
+    # Return both bits of info
+    {
+      image: product["image"],
+      name: product["name"]
+    }
   rescue
     nil
   end
 
   def search_google(query, gl, hl)
     return nil unless SERPAPI_KEY
+    # We search Google Images (tbm: isch)
     res = GoogleSearch.new(q: query, tbm: "isch", gl: gl.downcase, hl: hl, api_key: SERPAPI_KEY).get_hash
     (res[:images_results] || []).first(10).each do |img|
       url = img[:original]
@@ -122,6 +108,7 @@ class ImageHunter
   end
 
   def is_good?(url)
+    return false if url.nil? || url.empty?
     options = { timeout: 4, http_header: { 'User-Agent' => 'Chrome/90.0' } }
     size = FastImage.size(url, options)
     return false unless size
@@ -138,7 +125,6 @@ get '/' do
   erb :index
 end
 
-# This endpoint handles 1 item at a time. The JavaScript loop calls this repeatedly.
 get '/api/search' do
   content_type :json
   hunter = ImageHunter.new
@@ -249,21 +235,17 @@ __END__
 
     // Loop through every EAN one by one
     for (const gtin of lines) {
-      // update status
       document.getElementById('statusText').innerText = `Processing ${processed + 1} of ${lines.length}: ${gtin}...`;
       
-      // Add a "Loading" row
       const tr = document.createElement('tr');
       tr.id = 'row-' + gtin;
       tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Searching...</td><td>-</td><td>-</td>`;
       tbody.appendChild(tr);
 
       try {
-        // Call our Ruby Server
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
         
-        // Update the row with results
         if (data.found) {
           tr.innerHTML = `
             <td>${gtin}</td>
