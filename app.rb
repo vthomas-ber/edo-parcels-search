@@ -103,18 +103,15 @@ class ImageHunter
     keywords = @local_keywords[market] || "Ingredients Nutrition"
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
 
-    # STRATEGY 1: GOOGLE SHOPPING (Best Data)
     shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
     return shopping_data unless shopping_data[:ingredients] == "-"
 
-    # STRATEGY 2: GOLDMINE SITES
     goldmine = @data_sources[market]
     if goldmine
       data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
     
-    # STRATEGY 3: BRAND SEARCH
     if product_name
       data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
@@ -155,48 +152,45 @@ class ImageHunter
     end
   end
 
-  # --- AGGRESSIVE PARSER ---
+  # --- FIXED PARSER ---
   def extract_all_data(text_blob)
-    # 1. Normalize whitespace and remove common separators to make regex easier
     text_blob = text_blob.gsub(/\s+/, " ").gsub("|", " ")
 
-    # 2. Flexible Ingredients Regex
-    ing_regex = /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
+    # We use (?:...) for non-capturing groups on the labels, so they don't mess up our match index
     
-    nutri_regex = /(per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
+    ing_regex = /(?:ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(?:nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
+    
+    nutri_regex = /(?:per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
 
-    # 3. Aggressive Number Matcher
-    # Looks for: KEYWORD -> (optional stuff) -> NUMBER -> UNIT
-    # Example: "Fat < 0.5 g" or "Fat approx 10g"
-    
+    allergen_regex = /(?:allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(?:\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
+
+    may_regex = /(?:may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(?:\.|nutrition|voedings|$))/i
+
+    # NUMBER FINDER FIX:
+    # We now strictly look for the capturing group (\d+...) which is Group 1 because the Label is (?:...) non-capturing
     find_val = ->(keywords, units) {
-       # Regex Explanation:
-       # #{keywords} : The category name (e.g., Fat)
-       # [^0-9]{0,20}: Ignore up to 20 non-number chars (colons, spaces, words like "approx")
-       # ([<>]?\s*\d+[,\.]?\d*) : Capture the number (optional < > signs)
-       # \s*#{units} : Ensure the correct unit follows (g, kcal, etc)
-       regex = /#{keywords}[^0-9]{0,20}([<>]?\s*\d+[,\.]?\d*)\s*#{units}/i
+       regex = /#{keywords}[^0-9]{0,25}([<>]?\s*\d+[,\.]?\d*)\s*#{units}/i
        match = text_blob.match(regex)
        match ? "#{match[1]}#{units}" : "-"
     }
 
     data = {
-      weight: find_val.call("(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)", "(g|kg|ml|l|oz|cl)"),
+      weight: find_val.call("(?:weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)", "(?:g|kg|ml|l|oz|cl)"),
       ingredients: extract_text(text_blob, ing_regex),
-      allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i),
-      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
+      allergens: extract_text(text_blob, allergen_regex),
+      may_contain: extract_text(text_blob, may_regex),
       nutrition_header: extract_text(text_blob, nutri_regex),
       
-      energy: find_val.call("(energy|energie|valeur|valor|energi|energia)", "(kj|kcal)"),
-      fat: find_val.call("(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)", "g"),
-      saturates: find_val.call("(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone)", "g"),
-      carbs: find_val.call("(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)", "g"),
-      sugars: find_val.call("(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)", "g"),
-      protein: find_val.call("(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)", "g"),
-      fiber: find_val.call("(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)", "g"),
-      salt: find_val.call("(salt|salz|zout|sel|sale|sal|sól)", "g"),
+      energy: find_val.call("(?:energy|energie|valeur|valor|energi|energia)", "(?:kj|kcal)"),
+      fat: find_val.call("(?:fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)", "g"),
+      saturates: find_val.call("(?:saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone)", "g"),
+      carbs: find_val.call("(?:carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)", "g"),
+      sugars: find_val.call("(?:sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)", "g"),
+      protein: find_val.call("(?:protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)", "g"),
+      fiber: find_val.call("(?:fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)", "g"),
+      salt: find_val.call("(?:salt|salz|zout|sel|sale|sal|sól)", "g"),
       
-      organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
+      organic_cert: extract_text(text_blob, /([A-Z]{2}-(?:BIO|ÖKO|ORG)-\d+)/i)
     }
     return data
   end
@@ -204,7 +198,8 @@ class ImageHunter
   def extract_text(text, regex)
     match = text.match(regex)
     return "-" unless match
-    value = match[2] || match[1]
+    # For text lists, we grab the first capturing group because we used (?:...) for labels
+    value = match[1]
     return "-" if value.nil? || value.strip.empty?
     return value[0..400].strip 
   end
