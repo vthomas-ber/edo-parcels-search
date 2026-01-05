@@ -63,7 +63,7 @@ class ImageHunter
     # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
     
-    # 2. DATA HUNT (Strict Local Language)
+    # 2. DATA HUNT
     data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
     # 3. MERGE
@@ -97,30 +97,25 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER (Updated with Gem Logic) ---
+  # --- PART 2: DATA HUNTER ---
   def hunt_data(gtin, market, lang_code, product_name)
     return empty_data_set unless SERPAPI_KEY
     keywords = @local_keywords[market] || "Ingredients Nutrition"
-
-    # RULE 1: STRICT EXCLUSION
-    # We append this to ALL searches to ban OpenFoodFacts and other generic wikis
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
 
-    # STRATEGY 1: GOOGLE SHOPPING
+    # STRATEGY 1: GOOGLE SHOPPING (Best Data)
     shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
     return shopping_data unless shopping_data[:ingredients] == "-"
 
-    # STRATEGY 2: SNIPER SEARCH (Goldmine)
+    # STRATEGY 2: GOLDMINE SITES
     goldmine = @data_sources[market]
     if goldmine
-      puts "   👉 Sniper Search: #{goldmine}"
       data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
     
     # STRATEGY 3: BRAND SEARCH
     if product_name
-      puts "   👉 Name Search: #{product_name}"
       data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
@@ -131,20 +126,13 @@ class ImageHunter
   def run_shopping_search(query, market, lang_code)
     begin
       search = GoogleSearch.new(
-        q: query, 
-        tbm: "shop", 
-        gl: market.downcase, 
-        hl: lang_code, 
-        lr: "lang_#{lang_code}", # <--- NEW: Forces results in local language only
-        api_key: SERPAPI_KEY
+        q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
       )
       res = search.get_hash
-      
       big_text_blob = ""
       (res[:shopping_results] || []).first(3).each do |item|
         big_text_blob += " " + (item[:title] || "") + " " + (item[:snippet] || "") + " " + (item[:description] || "")
       end
-      
       return extract_all_data(big_text_blob)
     rescue
       return empty_data_set
@@ -154,50 +142,60 @@ class ImageHunter
   def run_text_search(query, market, lang_code)
     begin
       search = GoogleSearch.new(
-        q: query, 
-        gl: market.downcase, 
-        hl: lang_code, 
-        lr: "lang_#{lang_code}", # <--- NEW: Forces results in local language only
-        api_key: SERPAPI_KEY
+        q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
       )
       res = search.get_hash
-      
       big_text_blob = ""
       (res[:organic_results] || []).first(6).each do |item|
         big_text_blob += " " + (item[:snippet] || "")
       end
-      
       return extract_all_data(big_text_blob)
     rescue
       return empty_data_set
     end
   end
 
+  # --- AGGRESSIVE PARSER ---
   def extract_all_data(text_blob)
-    text_blob = text_blob.gsub(/\s+/, " ")
+    # 1. Normalize whitespace and remove common separators to make regex easier
+    text_blob = text_blob.gsub(/\s+/, " ").gsub("|", " ")
 
+    # 2. Flexible Ingredients Regex
     ing_regex = /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
     
     nutri_regex = /(per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
 
-    allergen_regex = /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
-
-    may_regex = /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(\.|nutrition|voedings|$))/i
+    # 3. Aggressive Number Matcher
+    # Looks for: KEYWORD -> (optional stuff) -> NUMBER -> UNIT
+    # Example: "Fat < 0.5 g" or "Fat approx 10g"
+    
+    find_val = ->(keywords, units) {
+       # Regex Explanation:
+       # #{keywords} : The category name (e.g., Fat)
+       # [^0-9]{0,20}: Ignore up to 20 non-number chars (colons, spaces, words like "approx")
+       # ([<>]?\s*\d+[,\.]?\d*) : Capture the number (optional < > signs)
+       # \s*#{units} : Ensure the correct unit follows (g, kcal, etc)
+       regex = /#{keywords}[^0-9]{0,20}([<>]?\s*\d+[,\.]?\d*)\s*#{units}/i
+       match = text_blob.match(regex)
+       match ? "#{match[1]}#{units}" : "-"
+    }
 
     data = {
-      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)\s*[:\.-]?\s*(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
+      weight: find_val.call("(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)", "(g|kg|ml|l|oz|cl)"),
       ingredients: extract_text(text_blob, ing_regex),
-      allergens: extract_text(text_blob, allergen_regex),
-      may_contain: extract_text(text_blob, may_regex),
+      allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i),
+      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
       nutrition_header: extract_text(text_blob, nutri_regex),
-      energy: extract_text(text_blob, /(energy|energie|valeur|valor|energi|energia).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|grassi|fedt|tłuszcz|$))/i),
-      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|dont|di cui|de las|varav|heraf|w tym|$))/i),
-      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone).*?([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
-      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|dont|zuccheri|sukker|cukry|$))/i),
-      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
-      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
-      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
-      salt: extract_text(text_blob, /(salt|salz|zout|sel|sale|sal|sól)\s*[:\.-]?\s*([<>]?\s*\d+[,\.]?\d*\s?g?)/i),
+      
+      energy: find_val.call("(energy|energie|valeur|valor|energi|energia)", "(kj|kcal)"),
+      fat: find_val.call("(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)", "g"),
+      saturates: find_val.call("(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone)", "g"),
+      carbs: find_val.call("(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)", "g"),
+      sugars: find_val.call("(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)", "g"),
+      protein: find_val.call("(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)", "g"),
+      fiber: find_val.call("(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)", "g"),
+      salt: find_val.call("(salt|salz|zout|sel|sale|sal|sól)", "g"),
+      
       organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
     }
     return data
