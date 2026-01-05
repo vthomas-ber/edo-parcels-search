@@ -157,15 +157,16 @@ __END__
   <div class="controls">
     <label><strong>Market:</strong></label>
     <select id="marketSelect">
-      <option value="DE">Germany (DE)</option>
-      <option value="UK">United Kingdom (UK)</option>
-      <option value="FR">France (FR)</option>
-      <option value="IT">Italy (IT)</option>
-      <option value="ES">Spain (ES)</option>
-      <option value="DK">Denmark (DK)</option>
-      <option value="NL">Netherlands (NL)</option>
-      <option value="BE">Belgium (BE)</option>
       <option value="AT">Austria (AT)</option>
+      <option value="BE">Belgium (BE)</option>
+      <option value="DK">Denmark (DK)</option>
+      <option value="FR">France (FR)</option>
+      <option value="DE">Germany (DE)</option>
+      <option value="IT">Italy (IT)</option>
+      <option value="NL">Netherlands (NL)</option>
+      <option value="UK">United Kingdom (UK)</option>
+      <option value="PL">Poland (PL)</option>
+      <option value="ES">Spain (ES)</option>
     </select>
   </div>
 
