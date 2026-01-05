@@ -20,10 +20,41 @@ class ImageHunter
       "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique België Belgium",
       "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal"
     }
+    
+    # Map Markets to Google Language Codes (hl)
     @country_langs = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
       "FR" => "fr", "BE" => "fr", "IT" => "it", "ES" => "es", "PL" => "pl",
       "DK" => "da", "NL" => "nl", "SE" => "sv", "NO" => "no", "PT" => "pt"
+    }
+    
+    # NEW: Localized Search Keywords
+    # We use these to force Google to find data in the correct language
+    @local_keywords = {
+      "DE" => "Zutaten Nährwerte", "AT" => "Zutaten Nährwerte", "CH" => "Zutaten Nährwerte",
+      "UK" => "Ingredients Nutrition", "GB" => "Ingredients Nutrition",
+      "FR" => "Ingrédients Nutrition", "BE" => "Ingrédients Nutrition", # French default for BE
+      "NL" => "Ingrediënten Voedingswaarden", 
+      "IT" => "Ingredienti Nutrizionali",
+      "ES" => "Ingredientes Nutrición",
+      "DK" => "Ingredienser Næringsindhold",
+      "SE" => "Ingredienser Näringsvärde",
+      "NO" => "Ingredienser Næringsinnhold",
+      "PL" => "Składniki Wartość odżywcza",
+      "PT" => "Ingredientes Nutrição"
+    }
+
+    # The Team Trusted Sources
+    @data_sources = {
+      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:courses.monoprix.fr OR site:labellevie.com OR site:chronodrive.com OR site:intermarche.com OR site:houra.fr OR site:bamcourses.com OR site:franprix.fr OR site:clic-shopping.com OR site:willyantigaspi.fr OR site:beansclub.fr",
+      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:groceries.morrisons.com OR site:iceland.co.uk OR site:aldi.co.uk OR site:poundland.co.uk OR site:marksandspencer.com OR site:amazon.co.uk OR site:bmstores.co.uk OR site:heronfoods.com OR site:poundstretcher.co.uk OR site:home.bargains OR site:therange.co.uk OR site:lowpricefoods.com OR site:approvedfood.co.uk OR site:discountdragon.co.uk OR site:productlibrary.brandbank.com OR site:nutricircle.co.uk",
+      "NL" => "site:ah.nl OR site:jumbo.com OR site:lidl.nl OR site:dirk.nl OR site:vomar.nl OR site:aldi.nl OR site:goflink.com OR site:picnic.app OR site:foodello.nl OR site:amazon.nl OR site:kruidvat.nl",
+      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be OR site:foodello.be OR site:amazon.com.be OR site:bol.com OR site:psinfoodservice.com OR site:checker.thequestionmark.org",
+      "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:netto.dk OR site:rema1000.dk OR site:lidl.dk OR site:365discount.coop.dk OR site:brugsen.coop.dk OR site:kvickly.coop.dk OR site:superbrugsen.coop.dk OR site:meny.dk OR site:dagrofa.dk OR site:motatos.dk OR site:normal.dk OR site:almamad.dk",
+      "DE" => "site:rewe.de OR site:kaufland.de",
+      "AT" => "site:rewe.de OR site:kaufland.de",
+      "ES" => "site:carrefour.es OR site:alcampo.es OR site:hipercor.es",
+      "IT" => "site:cosicomodo.it OR site:carrefour.it OR site:spesasicura.com OR site:conad.it OR site:esselunga.it"
     }
   end
 
@@ -36,7 +67,7 @@ class ImageHunter
     # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
     
-    # 2. DATA HUNT (Using Google Snippets)
+    # 2. DATA HUNT (Multilingual Sniper)
     data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
     # 3. MERGE
@@ -72,66 +103,79 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER (Snippet Strategy) ---
+  # --- PART 2: DATA HUNTER (Multilingual Strategy) ---
   def hunt_data(gtin, market, lang_code, product_name)
     return empty_data_set unless SERPAPI_KEY
 
-    # Strategy: Ask Google for the text directly
-    # We search for the GTIN + "Ingredients" to force the text into the snippet
-    query = "#{gtin} ingredients nutrition"
-    
-    # If we have a product name, use that too for better luck
-    if product_name
-      query = "#{product_name} ingredients nutrition"
+    # Get the local words for "Ingredients" and "Nutrition"
+    keywords = @local_keywords[market] || "Ingredients Nutrition"
+
+    # 1. THE GOLDMINE SEARCH (Trusted Sites + Local Keywords)
+    goldmine = @data_sources[market]
+    if goldmine
+      puts "   👉 Sniper Search in #{market}: #{goldmine}"
+      # We append the keywords so Google highlights the ingredient list in the snippet
+      data = run_text_search("#{goldmine} #{gtin} #{keywords}", market, lang_code)
+      return data unless data[:ingredients] == "-"
     end
     
-    puts "   👉 Hunting Data for: #{query}..."
+    # 2. THE BRAND SEARCH (Fallback)
+    if product_name
+      puts "   👉 Name Search: #{product_name} #{keywords}"
+      data = run_text_search("#{product_name} #{keywords}", market, lang_code)
+      return data unless data[:ingredients] == "-"
+    end
+    
+    # 3. THE BROAD SEARCH (Last Resort)
+    puts "   👉 Broad Search: #{gtin} #{keywords}"
+    return run_text_search("#{gtin} #{keywords}", market, lang_code)
+  end
 
+  def run_text_search(query, market, lang_code)
     begin
       search = GoogleSearch.new(q: query, gl: market.downcase, hl: lang_code, api_key: SERPAPI_KEY)
       res = search.get_hash
       
-      # We combine the snippets from the top 3 results into one big text block
-      # This increases the chance we catch the ingredients list
       big_text_blob = ""
-      (res[:organic_results] || []).first(3).each do |item|
+      (res[:organic_results] || []).first(5).each do |item|
         big_text_blob += " " + (item[:snippet] || "")
       end
-
-      # Also check 'Shopping' results if available (they have good data)
-      if res[:shopping_results]
-        (res[:shopping_results] || []).first(1).each do |item|
-           big_text_blob += " " + (item[:description] || "")
-        end
-      end
       
-      # Now we search the Google Text for our data
       return extract_all_data(big_text_blob)
-      
     rescue
       return empty_data_set
     end
   end
 
   def extract_all_data(text_blob)
-    # Clean up text
     text_blob = text_blob.gsub(/\s+/, " ")
 
+    # EXPANDED MULTILINGUAL REGEX
+    # Matches: Ingredients (EN), Zutaten (DE), Ingrédients (FR), Ingrediënten (NL), 
+    # Ingredienser (DK/SE/NO), Ingredientes (ES/PT), Ingredienti (IT), Składniki (PL)
+    ing_regex = /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.]\s*(.*?)(?=(nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
+    
+    # Matches: Nutrition Headers
+    nutri_regex = /(per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
+
+    # Matches: Allergens
+    allergen_regex = /(allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
+
     data = {
-      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
-      ingredients: extract_text(text_blob, /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling)\s*[:\.]\s*(.*?)(?=(nutrition|voedingswaarden|nährwerte|energy|energie|$))/i),
-      allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|$))/i),
-      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
-      nutrition_header: extract_text(text_blob, /(per 100\s?g|per 100\s?ml|per serving|pro 100\s?g|per portion|pour 100\s?g)/i),
+      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
+      ingredients: extract_text(text_blob, ing_regex),
+      allergens: extract_text(text_blob, allergen_regex),
+      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
+      nutrition_header: extract_text(text_blob, nutri_regex),
       
-      energy: extract_text(text_blob, /(energy|energie).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|$))/i),
-      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|$))/i),
-      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés).*?(\d+[,\.]?\d*\s?g?)/i),
-      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|$))/i),
-      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres)\s*(\d+[,\.]?\d*\s?g?)/i),
-      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines)\s*(\d+[,\.]?\d*\s?g?)/i),
-      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres)\s*(\d+[,\.]?\d*\s?g?)/i),
-      salt: extract_text(text_blob, /(salt|salz|zout|sel)\s*(\d+[,\.]?\d*\s?g?)/i),
+      energy: extract_text(text_blob, /(energy|energie|valeur|valor|energi|energia).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|grassi|fedt|tłuszcz|$))/i),
+      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|dont|di cui|de las|varav|heraf|w tym|$))/i),
+      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone).*?(\d+[,\.]?\d*\s?g?)/i),
+      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|dont|zuccheri|sukker|cukry|$))/i),
+      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)\s*(\d+[,\.]?\d*\s?g?)/i),
+      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)\s*(\d+[,\.]?\d*\s?g?)/i),
+      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)\s*(\d+[,\.]?\d*\s?g?)/i),
+      salt: extract_text(text_blob, /(salt|salz|zout|sel|sale|sal|sól)\s*(\d+[,\.]?\d*\s?g?)/i),
       organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
     }
     return data
