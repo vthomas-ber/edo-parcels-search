@@ -5,6 +5,7 @@ require 'fastimage'
 require 'json'
 require 'net/http'
 require 'uri'
+require 'nokogiri'
 
 # --- API KEYS ---
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
@@ -33,22 +34,20 @@ class ImageHunter
     country_name = @country_names[market] || ""
     lang_code = @country_langs[market] || "en"
     
-    # 1. VISUAL HUNT (Images)
+    # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
     
-    # 2. DATA HUNT (Text/Ingredients)
-    # We look for text specifically on barcodelookup or via Google Shopping
-    data_result = hunt_data(gtin, market, lang_code)
+    # 2. DATA HUNT (Deep Extract)
+    data_result = hunt_data(gtin, market, lang_code, image_result[:source])
 
-    # 3. MERGE RESULTS
+    # 3. MERGE
     final_result = image_result.merge(data_result)
-    
     return final_result
   end
 
   # --- PART 1: VISUAL HUNTER ---
   def hunt_visuals(gtin, market, country_name, lang_code)
-    # A. Check EAN-Search API first
+    # A. Check EAN-Search API
     if EAN_SEARCH_TOKEN
       api_data = check_ean_api(gtin) 
       if api_data && is_good?(api_data[:image])
@@ -61,7 +60,7 @@ class ImageHunter
       end
     end
 
-    # B. Check Google Images (Targeted Sites)
+    # B. Check Google Images (Targeted)
     site_res = search_google_images("site:barcodelookup.com \"#{gtin}\"", market, lang_code)
     return site_res if site_res
 
@@ -76,64 +75,91 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER (The "Reader") ---
-  def hunt_data(gtin, market, lang_code)
-    return {} unless SERPAPI_KEY
-    
-    # Strategy: We ask Google specifically for the "Ingredients" text associated with this EAN
-    # We prioritize 'barcodelookup.com' results because their text is clean.
-    query = "site:barcodelookup.com #{gtin}"
-    
-    begin
-      search = GoogleSearch.new(q: query, gl: "us", hl: "en", api_key: SERPAPI_KEY)
-      res = search.get_hash
-      
-      # We look at the 'organic_results' (The normal search results)
-      # The 'snippet' is the text Google previews (e.g., "Ingredients: Sugar, Water...")
-      results = res[:organic_results] || []
-      best_snippet = ""
-      
-      results.each do |item|
-        snippet = item[:snippet] || ""
-        # If this snippet has "Ingredients", it's the winner
-        if snippet.downcase.include?("ingredients") || snippet.downcase.include?("nutrition")
-          best_snippet = snippet
-          break
-        end
-      end
-      
-      # If BarcodeLookup failed, try a broad Shopping search
-      if best_snippet.empty?
-         shopping_search = GoogleSearch.new(q: gtin, tbm: "shop", gl: market.downcase, hl: lang_code, api_key: SERPAPI_KEY)
-         shop_res = shopping_search.get_hash
-         item = (shop_res[:shopping_results] || []).first
-         if item
-           best_snippet = (item[:description] || "") + " " + (item[:snippet] || "")
-         end
-      end
+  # --- PART 2: DATA HUNTER (Master Data Extraction) ---
+  def hunt_data(gtin, market, lang_code, source_url)
+    return empty_data_set unless SERPAPI_KEY
 
-      # EXTRACT DATA FROM TEXT
-      # Regex looks for patterns like "Energy: 200kcal" or "Ingredients: ..."
-      return {
-        ingredients: extract_text(best_snippet, /(ingredients|zutaten|ingrédients|ingrediënten)[:\s]+(.*?)(?=\.|\n|Nutrition|$)/i),
-        energy: extract_text(best_snippet, /(energy|energie)[:\s]+(.*?)(?=\.|,|$)/i),
-        fat: extract_text(best_snippet, /(fat|fett|vet|matières grasses)[:\s]+(.*?)(?=\.|,|$)/i),
-        sugars: extract_text(best_snippet, /(sugars|davon zucker|suikers)[:\s]+(.*?)(?=\.|,|$)/i),
-        protein: extract_text(best_snippet, /(protein|eiweiß|eiwit)[:\s]+(.*?)(?=\.|,|$)/i)
-      }
-    rescue => e
-      puts "Data Error: #{e.message}"
-      return {}
+    # Strategy 1: Read the Source Page from the Image Hunt
+    if source_url && source_url.start_with?("http")
+      puts "   👉 Reading Source Page: #{source_url}..."
+      page_data = scrape_page(source_url)
+      return page_data unless page_data[:ingredients] == "-"
     end
+
+    # Strategy 2: Search specifically for Data
+    puts "   👉 Searching for Data Source..."
+    query = "site:barcodelookup.com #{gtin}"
+    search = GoogleSearch.new(q: query, gl: "us", hl: "en", api_key: SERPAPI_KEY)
+    res = search.get_hash
+    
+    first_result = (res[:organic_results] || []).first
+    if first_result
+       data_link = first_result[:link]
+       puts "   👉 Reading Backup Data Page: #{data_link}..."
+       return scrape_page(data_link)
+    end
+
+    return empty_data_set
+  end
+
+  def scrape_page(url)
+    begin
+      html = Down.download(url, user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36").read
+    rescue
+      return empty_data_set
+    end
+
+    doc = Nokogiri::HTML(html)
+    # Get all text, clean up newlines/tabs
+    text_blob = doc.text.gsub(/\s+/, " ")
+
+    # Regex patterns for multiple languages
+    stop_words = "(nutrition|voedingswaarden|nährwerte|energy|energie|fat|fett|vet|$)"
+    
+    data = {
+      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
+      ingredients: extract_text(text_blob, /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling)\s*[:\.]\s*(.*?)(?=#{stop_words})/i).gsub("\n", " "),
+      allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|$))/i),
+      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
+      nutrition_header: extract_text(text_blob, /(per 100\s?g|per 100\s?ml|per serving|pro 100\s?g|per portion|pour 100\s?g)/i),
+      
+      energy: extract_text(text_blob, /(energy|energie).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|$))/i),
+      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|$))/i),
+      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés).*?(\d+[,\.]?\d*\s?g?)/i),
+      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|$))/i),
+      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres)\s*(\d+[,\.]?\d*\s?g?)/i),
+      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines)\s*(\d+[,\.]?\d*\s?g?)/i),
+      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres)\s*(\d+[,\.]?\d*\s?g?)/i),
+      salt: extract_text(text_blob, /(salt|salz|zout|sel)\s*(\d+[,\.]?\d*\s?g?)/i),
+      organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
+    }
+    
+    # Fallback: If weight isn't found in text, try looking in the title (often used in barcodes sites)
+    if data[:weight] == "-"
+      title_match = doc.title.match(/(\d+\s?(g|kg|ml|l|cl))/i)
+      data[:weight] = title_match[1] if title_match
+    end
+
+    return data
+  end
+
+  def extract_text(text, regex)
+    match = text.match(regex)
+    return "-" unless match
+    # Group 2 usually holds the value, but sometimes Group 1 if the regex is simple
+    value = match[2] || match[1]
+    return "-" if value.nil? || value.strip.empty?
+    return value[0..400].strip # Safety limit
+  end
+
+  def empty_data_set
+    { 
+      weight: "-", ingredients: "-", allergens: "-", may_contain: "-", nutrition_header: "-",
+      energy: "-", fat: "-", saturates: "-", carbs: "-", sugars: "-", protein: "-", fiber: "-", salt: "-", organic_cert: "-"
+    }
   end
 
   # --- HELPER FUNCTIONS ---
-  
-  def extract_text(text, regex)
-    match = text.match(regex)
-    return match ? match[2].strip : "-"
-  end
-
   def check_ean_api(gtin)
     url = URI("https://api.ean-search.org/api?token=#{EAN_SEARCH_TOKEN}&op=barcode-lookup&ean=#{gtin}&format=json")
     response = Net::HTTP.get(url)
@@ -192,7 +218,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG Data Hunter</title>
+  <title>TGTG Master Data Hunter</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; padding: 20px; color: #333; }
     .container { max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); overflow-x: auto; }
@@ -209,13 +235,13 @@ __END__
     .status-missing { color: #dc3545; font-weight: bold; }
     .img-preview { max-height: 60px; max-width: 60px; object-fit: contain; }
     .source-link { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
-    .data-cell { font-family: monospace; color: #555; max-width: 200px; white-space: pre-wrap; word-wrap: break-word; }
+    .data-cell { font-family: monospace; color: #555; max-width: 250px; white-space: pre-wrap; word-wrap: break-word; }
   </style>
 </head>
 <body>
 
 <div class="container">
-  <h1>🍏 TGTG Data Hunter</h1>
+  <h1>🍏 TGTG Master Data Hunter</h1>
   <div class="controls">
     <label><strong>Market:</strong></label>
     <select id="marketSelect">
@@ -229,13 +255,14 @@ __END__
       <option value="DK">Denmark (DK)</option>
       <option value="SE">Sweden (SE)</option>
       <option value="PL">Poland (PL)</option>
+      <option value="AT">Austria (AT)</option>
     </select>
   </div>
 
   <textarea id="inputList" placeholder="Paste GTINs here..."></textarea>
   <br><br>
   <button id="startBtn" onclick="startBatch()">🚀 Start Data Hunt</button>
-  <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ CSV</button>
+  <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download CSV</button>
   
   <p id="statusText">Ready.</p>
 
@@ -245,11 +272,11 @@ __END__
         <th>GTIN</th>
         <th>Status</th>
         <th>Image</th>
+        <th>Weight</th>
         <th>Ingredients</th>
+        <th>Allergens</th>
         <th>Energy</th>
-        <th>Fat</th>
         <th>Sugars</th>
-        <th>Protein</th>
         <th>Source</th>
       </tr>
     </thead>
@@ -265,70 +292,4 @@ __END__
     const market = document.getElementById('marketSelect').value;
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     
-    if (lines.length === 0) { alert("Paste EANs first!"); return; }
-
-    document.getElementById('startBtn').disabled = true;
-    const tbody = document.querySelector('#resultsTable tbody');
-    tbody.innerHTML = "";
-    resultsData = [];
-    
-    let processed = 0;
-
-    for (const gtin of lines) {
-      document.getElementById('statusText').innerText = `Hunting ${gtin}...`;
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${gtin}</td><td style="color:orange">...</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>`;
-      tbody.appendChild(tr);
-
-      try {
-        const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
-        const data = await response.json();
-        
-        tr.innerHTML = `
-          <td>${gtin}</td>
-          <td class="${data.found ? 'status-found' : 'status-missing'}">${data.found ? 'Found' : 'Missing'}</td>
-          <td>${data.url ? `<img src="${data.url}" class="img-preview">` : '❌'}</td>
-          <td class="data-cell">${data.ingredients || '-'}</td>
-          <td class="data-cell">${data.energy || '-'}</td>
-          <td class="data-cell">${data.fat || '-'}</td>
-          <td class="data-cell">${data.sugars || '-'}</td>
-          <td class="data-cell">${data.protein || '-'}</td>
-          <td>${data.source ? `<a href="${data.source}" target="_blank" class="source-link">Link</a>` : '-'}</td>
-        `;
-        
-        resultsData.push({ 
-          gtin, market, 
-          status: data.found ? 'Found' : 'Missing', 
-          url: data.url, 
-          source: data.source,
-          ingredients: data.ingredients,
-          energy: data.energy,
-          fat: data.fat,
-          sugars: data.sugars,
-          protein: data.protein
-        });
-
-      } catch (e) { console.error(e); }
-      
-      processed++;
-    }
-    document.getElementById('startBtn').disabled = false;
-    document.getElementById('downloadBtn').style.display = "inline-block";
-    document.getElementById('statusText').innerText = "Done!";
-  }
-
-  function downloadCSV() {
-    let csv = "GTIN,Market,Status,ImageURL,Ingredients,Energy,Fat,Sugars,Protein,SourceURL\n";
-    resultsData.forEach(row => {
-      const ing = (row.ingredients || "").replace(/,/g, " ");
-      csv += `${row.gtin},${row.market},${row.status},${row.url},${ing},${row.energy},${row.fat},${row.sugars},${row.protein},${row.source}\n`;
-    });
-    const link = document.createElement("a");
-    link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
-    link.download = "tgtg_data_hunt.csv";
-    link.click();
-  }
-</script>
-
-</body>
-</html>
+    if (lines.
