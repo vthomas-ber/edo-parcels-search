@@ -6,10 +6,6 @@ require 'json'
 require 'net/http'
 require 'uri'
 
-# --- SERVER SETTINGS ---
-set :bind, '0.0.0.0'
-set :port, 8080
-
 # --- API KEYS ---
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
