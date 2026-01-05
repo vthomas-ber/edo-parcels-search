@@ -28,7 +28,7 @@ class ImageHunter
   end
 
   def find_image(gtin, market)
-    return nil if gtin.nil? || gtin.strip.empty?
+    return { found: false } if gtin.nil? || gtin.strip.empty?
     market = market.upcase
     country_name = @country_names[market] || ""
     lang_code = @country_langs[market] || "en"
@@ -40,38 +40,36 @@ class ImageHunter
       api_data = check_ean_api(gtin) 
       if api_data
         # If they have a good photo, use it!
-        return api_data[:image] if is_good?(api_data[:image])
-        # Save the name (e.g. "Olvarit Bio")
+        # EAN-Search is the source, so we link to their lookup page
+        if is_good?(api_data[:image])
+          return { found: true, url: api_data[:image], source: "https://www.ean-search.org/?q=#{gtin}" }
+        end
         product_name = api_data[:name]
       end
     end
 
-    # --- ATTEMPT 2: TARGETED SITE SEARCH ---
-    # We pass 'product_name' to verify the result matches the brand
-    site_img = search_google("site:barcodelookup.com \"#{gtin}\"", market, lang_code, product_name)
-    return site_img if site_img
+    # --- ATTEMPT 2: TARGETED SITE SEARCH (BarcodeLookup) ---
+    site_res = search_google("site:barcodelookup.com \"#{gtin}\"", market, lang_code)
+    return site_res if site_res
 
     # --- ATTEMPT 3: STRICT GOOGLE SEARCH ---
-    strict_img = search_google("\"#{gtin}\" #{country_name}", market, lang_code, product_name)
-    return strict_img if strict_img
+    strict_res = search_google("\"#{gtin}\" #{country_name}", market, lang_code)
+    return strict_res if strict_res
 
     # --- ATTEMPT 4: BROAD GOOGLE SEARCH ---
-    broad_img = search_google("\"#{gtin}\"", market, lang_code, product_name)
-    return broad_img if broad_img
+    broad_res = search_google("\"#{gtin}\"", market, lang_code)
+    return broad_res if broad_res
 
     # --- ATTEMPT 5: NAME SEARCH ---
     if product_name
-      # Remove weird symbols to clean up name
       clean_name = product_name.gsub(/[^a-zA-Z0-9\s]/, '') 
-      # Don't pass product_name to filter here, because we ARE searching by name
-      name_img = search_google(clean_name, market, lang_code, nil)
-      return name_img if name_img
+      name_res = search_google(clean_name, market, lang_code)
+      return name_res if name_res
     end
 
-    return nil
+    return { found: false }
   end
 
-  # --- HELPER: EAN API ---
   def check_ean_api(gtin)
     url = URI("https://api.ean-search.org/api?token=#{EAN_SEARCH_TOKEN}&op=barcode-lookup&ean=#{gtin}&format=json")
     response = Net::HTTP.get(url)
@@ -83,34 +81,21 @@ class ImageHunter
     nil
   end
 
-  # --- HELPER: GOOGLE SEARCH ---
-  # Now accepts 'must_match_name' to filter out wrong products
-  def search_google(query, gl, hl, must_match_name=nil)
+  def search_google(query, gl, hl)
     return nil unless SERPAPI_KEY
     
     res = GoogleSearch.new(q: query, tbm: "isch", gl: gl.downcase, hl: hl, api_key: SERPAPI_KEY).get_hash
-    results = res[:images_results] || []
-
-    results.first(15).each do |img|
+    (res[:images_results] || []).first(10).each do |img|
       url = img[:original]
-      title = img[:title].to_s.downcase
-
-      # 1. BLOCK BAD SOURCES (Updated)
-      next if url.include?("pinterest") || url.include?("ebay") || url.include?("stock")
-      next if url.include?("openfoodfacts") # <-- NEW: Block low quality user uploads
+      source_page = img[:link] # This grabs the website URL where the image was found
       
-      # 2. BRAND VERIFICATION (The Fix for the "Wrong Image" bug)
-      # If we know the name is "Olvarit", skip images that don't say "Olvarit" in the title
-      if must_match_name
-        # We check the first word of the product name (usually the Brand)
-        brand_keyword = must_match_name.split(' ').first.to_s.downcase
-        # If the brand is missing from the Google Title, it's likely a cross-sell/wrong item
-        if brand_keyword.length > 2 && !title.include?(brand_keyword)
-           next 
-        end
+      # --- BLOCK LIST ---
+      next if url.include?("pinterest") || url.include?("ebay")
+      next if url.include?("openfoodfacts") 
+      
+      if is_good?(url)
+        return { found: true, url: url, source: source_page }
       end
-
-      return url if is_good?(url)
     end
     nil
   rescue
@@ -123,7 +108,6 @@ class ImageHunter
     size = FastImage.size(url, options)
     return false unless size
     w, h = size
-    # Allow slightly wider variations, but keep quality high
     return w > 300 && (w.to_f / h.to_f).between?(0.3, 2.5)
   rescue
     false
@@ -131,6 +115,7 @@ class ImageHunter
 end
 
 # --- WEB ROUTES ---
+
 get '/' do
   erb :index
 end
@@ -138,12 +123,8 @@ end
 get '/api/search' do
   content_type :json
   hunter = ImageHunter.new
-  url = hunter.find_image(params[:gtin], params[:market])
-  if url
-    { found: true, url: url }.to_json
-  else
-    { found: false }.to_json
-  end
+  result = hunter.find_image(params[:gtin], params[:market])
+  result.to_json
 end
 
 __END__
@@ -152,57 +133,70 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG Bulk Hunter v3</title>
+  <title>TGTG Bulk Hunter</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; padding: 20px; color: #333; }
-    .container { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+    .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
     h1 { color: #00816A; margin-top: 0; }
+    
     .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; background: #eefcf9; padding: 15px; border-radius: 8px; }
     textarea { width: 100%; height: 150px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font-family: monospace; font-size: 14px; margin-bottom: 10px; }
+    
     button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px; transition: background 0.2s; }
     button:hover { background: #006653; }
     button:disabled { background: #ccc; cursor: not-allowed; }
+    
     select, input { padding: 10px; border-radius: 6px; border: 1px solid #ccc; }
+    
     table { width: 100%; border-collapse: collapse; margin-top: 20px; }
     th { text-align: left; background: #00816A; color: white; padding: 12px; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: middle; }
     tr:nth-child(even) { background: #f9f9f9; }
+    
     .status-found { color: #28a745; font-weight: bold; }
     .status-missing { color: #dc3545; font-weight: bold; }
     .img-preview { max-height: 80px; max-width: 80px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; }
+    
     .progress-bar { height: 6px; background: #eee; border-radius: 3px; margin-top: 10px; overflow: hidden; }
     .progress-fill { height: 100%; background: #00816A; width: 0%; transition: width 0.3s; }
+
+    .source-link { color: #00816A; text-decoration: none; font-size: 14px; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; }
+    .source-link:hover { background: #00816A; color: white; }
   </style>
 </head>
 <body>
 
 <div class="container">
   <h1>🍏 TGTG Bulk Image Hunter</h1>
-  <p>Paste a list of GTINs/EANs below.</p>
+  <p>Paste a list of GTINs/EANs below to search for them automatically.</p>
 
   <div class="controls">
     <label><strong>Market:</strong></label>
     <select id="marketSelect">
-      <option value="AT">Austria (AT)</option>
-      <option value="BE">Belgium (BE)</option>
-      <option value="DK">Denmark (DK)</option>
-      <option value="FR">France (FR)</option>
       <option value="DE">Germany (DE)</option>
-      <option value="IT">Italy (IT)</option>
-      <option value="NL">Netherlands (NL)</option>
       <option value="UK">United Kingdom (UK)</option>
-      <option value="PL">Poland (PL)</option>
+      <option value="FR">France (FR)</option>
+      <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
+      <option value="DK">Denmark (DK)</option>
+      <option value="NL">Netherlands (NL)</option>
+      <option value="BE">Belgium (BE)</option>
+      <option value="AT">Austria (AT)</option>
+      <option value="CH">Switzerland (CH)</option>
+      <option value="PL">Poland (PL)</option>
+      <option value="SE">Sweden (SE)</option>
+      <option value="NO">Norway (NO)</option>
+      <option value="PT">Portugal (PT)</option>
     </select>
   </div>
 
-  <textarea id="inputList" placeholder="Paste your EANs here (one per line)"></textarea>
+  <textarea id="inputList" placeholder="Paste your EANs here (one per line)&#10;4260407955266&#10;7610400081405&#10;..."></textarea>
   
   <button id="startBtn" onclick="startBatch()">🚀 Start Batch Search</button>
   <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download Results</button>
   
   <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
-  <p id="statusText" style="color: #666; font-size: 14px;">Ready.</p>
+  <p id="statusText" style="color: #666; font-size: 14px;">Ready to start.</p>
 
   <table id="resultsTable">
     <thead>
@@ -210,7 +204,8 @@ __END__
         <th>GTIN</th>
         <th>Status</th>
         <th>Image Preview</th>
-        <th>Link</th>
+        <th>Download Image</th>
+        <th>Source / Variants</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -239,7 +234,7 @@ __END__
       
       const tr = document.createElement('tr');
       tr.id = 'row-' + gtin;
-      tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Searching...</td><td>-</td><td>-</td>`;
+      tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Searching...</td><td>-</td><td>-</td><td>-</td>`;
       tbody.appendChild(tr);
 
       try {
@@ -251,20 +246,22 @@ __END__
             <td>${gtin}</td>
             <td class="status-found">Found</td>
             <td><img src="${data.url}" class="img-preview"></td>
-            <td><a href="${data.url}" target="_blank">View</a></td>
+            <td><a href="${data.url}" target="_blank">View Full</a></td>
+            <td><a href="${data.source}" target="_blank" class="source-link">🔗 See Variants</a></td>
           `;
-          resultsData.push({ gtin, market, status: 'Found', url: data.url });
+          resultsData.push({ gtin, market, status: 'Found', url: data.url, source: data.source });
         } else {
           tr.innerHTML = `
             <td>${gtin}</td>
             <td class="status-missing">Missing</td>
             <td>❌</td>
             <td>-</td>
+            <td>-</td>
           `;
-          resultsData.push({ gtin, market, status: 'Missing', url: '' });
+          resultsData.push({ gtin, market, status: 'Missing', url: '', source: '' });
         }
       } catch (e) {
-        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td><td>-</td><td>-</td>`;
+        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td><td>-</td><td>-</td><td>-</td>`;
       }
 
       processed++;
@@ -278,9 +275,9 @@ __END__
   }
 
   function downloadCSV() {
-    let csvContent = "data:text/csv;charset=utf-8,GTIN,Market,Status,ImageURL\n";
+    let csvContent = "data:text/csv;charset=utf-8,GTIN,Market,Status,ImageURL,SourceURL\n";
     resultsData.forEach(row => {
-      csvContent += `${row.gtin},${row.market},${row.status},${row.url}\n`;
+      csvContent += `${row.gtin},${row.market},${row.status},${row.url},${row.source}\n`;
     });
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
