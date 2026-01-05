@@ -36,8 +36,8 @@ class ImageHunter
     # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
     
-    # 2. DATA HUNT
-    data_result = hunt_data(gtin, market, lang_code, image_result[:source])
+    # 2. DATA HUNT (Using Google Snippets)
+    data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
     # 3. MERGE
     final_result = image_result.merge(data_result)
@@ -72,69 +72,69 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER ---
-  def hunt_data(gtin, market, lang_code, source_url)
+  # --- PART 2: DATA HUNTER (Snippet Strategy) ---
+  def hunt_data(gtin, market, lang_code, product_name)
     return empty_data_set unless SERPAPI_KEY
 
-    # Strategy 1: Read the page where we found the image
-    if source_url && source_url.start_with?("http")
-      page_data = scrape_page(source_url)
-      return page_data unless page_data[:ingredients] == "-"
-    end
-
-    # Strategy 2: If no data yet, search specifically for a data source
-    query = "site:barcodelookup.com #{gtin}"
-    search = GoogleSearch.new(q: query, gl: "us", hl: "en", api_key: SERPAPI_KEY)
-    res = search.get_hash
+    # Strategy: Ask Google for the text directly
+    # We search for the GTIN + "Ingredients" to force the text into the snippet
+    query = "#{gtin} ingredients nutrition"
     
-    first_result = (res[:organic_results] || []).first
-    if first_result
-       data_link = first_result[:link]
-       return scrape_page(data_link)
+    # If we have a product name, use that too for better luck
+    if product_name
+      query = "#{product_name} ingredients nutrition"
     end
+    
+    puts "   👉 Hunting Data for: #{query}..."
 
-    return empty_data_set
-  end
-
-  def scrape_page(url)
     begin
-      # Download raw HTML
-      html = Down.download(url, user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").read
+      search = GoogleSearch.new(q: query, gl: market.downcase, hl: lang_code, api_key: SERPAPI_KEY)
+      res = search.get_hash
       
-      # LIGHTWEIGHT CLEANER (Replaces Nokogiri)
-      # 1. Remove scripts and styles
-      html = html.gsub(/<script.*?>.*?<\/script>/m, " ")
-      html = html.gsub(/<style.*?>.*?<\/style>/m, " ")
-      # 2. Remove HTML tags
-      text_blob = html.gsub(/<[^>]*>/, " ")
-      # 3. Clean whitespace
-      text_blob = text_blob.gsub(/\s+/, " ")
+      # We combine the snippets from the top 3 results into one big text block
+      # This increases the chance we catch the ingredients list
+      big_text_blob = ""
+      (res[:organic_results] || []).first(3).each do |item|
+        big_text_blob += " " + (item[:snippet] || "")
+      end
 
-      # Regex Patterns
-      stop_words = "(nutrition|voedingswaarden|nährwerte|energy|energie|fat|fett|vet|average values|$)"
+      # Also check 'Shopping' results if available (they have good data)
+      if res[:shopping_results]
+        (res[:shopping_results] || []).first(1).each do |item|
+           big_text_blob += " " + (item[:description] || "")
+        end
+      end
       
-      data = {
-        weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
-        ingredients: extract_text(text_blob, /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling)\s*[:\.]\s*(.*?)(?=#{stop_words})/i).gsub("\n", " "),
-        allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|$))/i),
-        may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
-        nutrition_header: extract_text(text_blob, /(per 100\s?g|per 100\s?ml|per serving|pro 100\s?g|per portion|pour 100\s?g)/i),
-        
-        energy: extract_text(text_blob, /(energy|energie).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|$))/i),
-        fat: extract_text(text_blob, /(fat|fett|vet|matières grasses)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|$))/i),
-        saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés).*?(\d+[,\.]?\d*\s?g?)/i),
-        carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|$))/i),
-        sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres)\s*(\d+[,\.]?\d*\s?g?)/i),
-        protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines)\s*(\d+[,\.]?\d*\s?g?)/i),
-        fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres)\s*(\d+[,\.]?\d*\s?g?)/i),
-        salt: extract_text(text_blob, /(salt|salz|zout|sel)\s*(\d+[,\.]?\d*\s?g?)/i),
-        organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
-      }
+      # Now we search the Google Text for our data
+      return extract_all_data(big_text_blob)
       
-      return data
     rescue
       return empty_data_set
     end
+  end
+
+  def extract_all_data(text_blob)
+    # Clean up text
+    text_blob = text_blob.gsub(/\s+/, " ")
+
+    data = {
+      weight: extract_text(text_blob, /(weight|gewicht|inhoud|netto|poids|size)[:\s]+(\d+\s?(g|kg|ml|l|oz|cl))\b/i),
+      ingredients: extract_text(text_blob, /(ingredients|zutaten|ingrédients|ingrediënten|samenstelling)\s*[:\.]\s*(.*?)(?=(nutrition|voedingswaarden|nährwerte|energy|energie|$))/i),
+      allergens: extract_text(text_blob, /(allergens|allergene|allergie|bevat|contains)\s*[:\.]\s*(.*?)(?=(\.|may contain|kann spuren|kan sporen|$))/i),
+      may_contain: extract_text(text_blob, /(may contain|kann spuren|kan sporen)\s*[:\.]\s*(.*?)(?=(\.|nutrition|voedings|$))/i),
+      nutrition_header: extract_text(text_blob, /(per 100\s?g|per 100\s?ml|per serving|pro 100\s?g|per portion|pour 100\s?g)/i),
+      
+      energy: extract_text(text_blob, /(energy|energie).*?(\d+\s?(kj|kcal).*?)(?=(fat|fett|vet|matières|$))/i),
+      fat: extract_text(text_blob, /(fat|fett|vet|matières grasses)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|saturates|davon|waarvan|$))/i),
+      saturates: extract_text(text_blob, /(saturates|saturated|gesättigte|verzadigde|saturés).*?(\d+[,\.]?\d*\s?g?)/i),
+      carbs: extract_text(text_blob, /(carbohydrate|kohlenhydrate|koolhydraten|glucides)\s*(\d+[,\.]?\d*\s?g?)(?=(of which|sugars|davon|waarvan|$))/i),
+      sugars: extract_text(text_blob, /(sugars|zucker|suikers|sucres)\s*(\d+[,\.]?\d*\s?g?)/i),
+      protein: extract_text(text_blob, /(protein|eiweiß|eiwit|protéines)\s*(\d+[,\.]?\d*\s?g?)/i),
+      fiber: extract_text(text_blob, /(fiber|ballaststoffe|vezels|fibres)\s*(\d+[,\.]?\d*\s?g?)/i),
+      salt: extract_text(text_blob, /(salt|salz|zout|sel)\s*(\d+[,\.]?\d*\s?g?)/i),
+      organic_cert: extract_text(text_blob, /([A-Z]{2}-(BIO|ÖKO|ORG)-\d+)/i)
+    }
+    return data
   end
 
   def extract_text(text, regex)
@@ -220,9 +220,8 @@ __END__
     button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; cursor: pointer; }
     button:disabled { background: #ccc; }
     
-    /* SCROLLABLE TABLE */
     .table-wrapper { overflow-x: auto; margin-top: 20px; border: 1px solid #eee; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2000px; /* Forces scroll bar */ }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2000px; }
     th { text-align: left; background: #00816A; color: white; padding: 10px; white-space: nowrap; position: sticky; left: 0; }
     td { padding: 10px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; word-wrap: break-word; }
     tr:nth-child(even) { background: #f9f9f9; }
@@ -291,111 +290,71 @@ __END__
 </div>
 
 <script>
-  // Robust JS Setup
   let resultsData = [];
-  
-  // Attach event listener safely
   document.getElementById('startBtn').addEventListener('click', startBatch);
 
   async function startBatch() {
-    try {
-      const inputField = document.getElementById('inputList');
-      if (!inputField) { alert("Error: Input box missing"); return; }
-      
-      const text = inputField.value;
-      const market = document.getElementById('marketSelect').value;
-      const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-      
-      if (lines.length === 0) { alert("Please paste some EANs first!"); return; }
+    const text = document.getElementById('inputList').value;
+    const market = document.getElementById('marketSelect').value;
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    
+    if (lines.length === 0) { alert("Paste EANs first!"); return; }
 
-      document.getElementById('startBtn').disabled = true;
-      document.getElementById('statusText').innerText = "Starting...";
-      const tbody = document.querySelector('#resultsTable tbody');
-      tbody.innerHTML = "";
-      resultsData = [];
-      
-      let processed = 0;
+    document.getElementById('startBtn').disabled = true;
+    const tbody = document.querySelector('#resultsTable tbody');
+    tbody.innerHTML = "";
+    resultsData = [];
+    
+    let processed = 0;
 
-      for (const gtin of lines) {
-        document.getElementById('statusText').innerText = `Hunting ${gtin} (${processed + 1}/${lines.length})...`;
-        const tr = document.createElement('tr');
-        // Create a row with empty cells for all columns
-        let emptyCells = "";
-        for(let i=0; i<16; i++) { emptyCells += "<td></td>"; }
-        tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Loading...</td>` + emptyCells;
-        tbody.appendChild(tr);
+    for (const gtin of lines) {
+      document.getElementById('statusText').innerText = `Hunting ${gtin} (${processed + 1}/${lines.length})...`;
+      const tr = document.createElement('tr');
+      let emptyCells = ""; for(let i=0; i<16; i++) { emptyCells += "<td></td>"; }
+      tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Loading...</td>` + emptyCells;
+      tbody.appendChild(tr);
 
-        try {
-          const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
-          if (!response.ok) throw new Error("Network error");
-          
-          const data = await response.json();
-          
-          tr.innerHTML = `
-            <td>${gtin}</td>
-            <td class="${data.found ? 'status-found' : 'status-missing'}">${data.found ? 'Found' : 'Missing'}</td>
-            <td>${data.url ? `<img src="${data.url}" class="img-preview">` : '❌'}</td>
-            <td>${data.weight}</td>
-            <td>${(data.ingredients || '-').substring(0, 50)}...</td>
-            <td>${data.allergens}</td>
-            <td>${data.may_contain}</td>
-            <td>${data.nutrition_header}</td>
-            <td>${data.energy}</td>
-            <td>${data.fat}</td>
-            <td>${data.saturates}</td>
-            <td>${data.carbs}</td>
-            <td>${data.sugars}</td>
-            <td>${data.protein}</td>
-            <td>${data.fiber}</td>
-            <td>${data.salt}</td>
-            <td>${data.organic_cert}</td>
-            <td>${data.source ? `<a href="${data.source}" target="_blank" class="source-link">Link</a>` : '-'}</td>
-          `;
-          
-          resultsData.push({ ...data, gtin, market, status: data.found ? 'Found' : 'Missing' });
-
-        } catch (e) { 
-          console.error(e); 
-          let errorCells = "";
-          for(let i=0; i<16; i++) { errorCells += "<td>-</td>"; }
-          tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td>` + errorCells;
-        }
+      try {
+        const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
+        const data = await response.json();
         
-        processed++;
+        tr.innerHTML = `
+          <td>${gtin}</td>
+          <td class="${data.found ? 'status-found' : 'status-missing'}">${data.found ? 'Found' : 'Missing'}</td>
+          <td>${data.url ? `<img src="${data.url}" class="img-preview">` : '❌'}</td>
+          <td>${data.weight}</td>
+          <td>${(data.ingredients || '-').substring(0, 50)}...</td>
+          <td>${data.allergens}</td>
+          <td>${data.may_contain}</td>
+          <td>${data.nutrition_header}</td>
+          <td>${data.energy}</td>
+          <td>${data.fat}</td>
+          <td>${data.saturates}</td>
+          <td>${data.carbs}</td>
+          <td>${data.sugars}</td>
+          <td>${data.protein}</td>
+          <td>${data.fiber}</td>
+          <td>${data.salt}</td>
+          <td>${data.organic_cert}</td>
+          <td>${data.source ? `<a href="${data.source}" target="_blank" class="source-link">Link</a>` : '-'}</td>
+        `;
+        resultsData.push({ ...data, gtin, market, status: data.found ? 'Found' : 'Missing' });
+      } catch (e) { 
+        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td>` + emptyCells;
       }
-      document.getElementById('startBtn').disabled = false;
-      document.getElementById('downloadBtn').style.display = "inline-block";
-      document.getElementById('statusText').innerText = "Batch Complete!";
-      
-    } catch (criticalError) {
-      alert("Critical Error: " + criticalError.message);
-      document.getElementById('startBtn').disabled = false;
+      processed++;
     }
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('downloadBtn').style.display = "inline-block";
+    document.getElementById('statusText').innerText = "Batch Complete!";
   }
 
   function downloadCSV() {
     let csv = "GTIN,Market,Status,ImageURL,SourceURL,Weight,Ingredients,Allergens,MayContain,NutritionHeader,Energy,Fat,Saturates,Carbohydrates,Sugars,Protein,Fiber,Salt,OrganicID\n";
-    
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
-      
-      csv += `${row.gtin},${row.market},${row.status},${row.url},${row.source},` +
-             `${clean(row.weight)},` +
-             `${clean(row.ingredients)},` +
-             `${clean(row.allergens)},` +
-             `${clean(row.may_contain)},` +
-             `${clean(row.nutrition_header)},` +
-             `${clean(row.energy)},` +
-             `${clean(row.fat)},` +
-             `${clean(row.saturates)},` +
-             `${clean(row.carbs)},` +
-             `${clean(row.sugars)},` +
-             `${clean(row.protein)},` +
-             `${clean(row.fiber)},` +
-             `${clean(row.salt)},` +
-             `${clean(row.organic_cert)}\n`;
+      csv += `${row.gtin},${row.market},${row.status},${row.url},${row.source},${clean(row.weight)},${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},${clean(row.nutrition_header)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},${clean(row.salt)},${clean(row.organic_cert)}\n`;
     });
-    
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
     link.download = "tgtg_master_data.csv";
