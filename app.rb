@@ -41,14 +41,15 @@ class ImageHunter
       "PT" => "Ingredientes Nutrição"
     }
 
+    # TEAM TRUSTED SOURCES (The Goldmine)
     @data_sources = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:courses.monoprix.fr OR site:labellevie.com OR site:chronodrive.com OR site:intermarche.com OR site:houra.fr OR site:bamcourses.com OR site:franprix.fr OR site:clic-shopping.com OR site:willyantigaspi.fr OR site:beansclub.fr",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:groceries.morrisons.com OR site:iceland.co.uk OR site:aldi.co.uk OR site:poundland.co.uk OR site:marksandspencer.com OR site:amazon.co.uk OR site:bmstores.co.uk OR site:heronfoods.com OR site:poundstretcher.co.uk OR site:home.bargains OR site:therange.co.uk OR site:lowpricefoods.com OR site:approvedfood.co.uk OR site:discountdragon.co.uk OR site:productlibrary.brandbank.com OR site:nutricircle.co.uk",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:lidl.nl OR site:dirk.nl OR site:vomar.nl OR site:aldi.nl OR site:goflink.com OR site:picnic.app OR site:foodello.nl OR site:amazon.nl OR site:kruidvat.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be OR site:foodello.be OR site:amazon.com.be OR site:bol.com OR site:psinfoodservice.com OR site:checker.thequestionmark.org",
       "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:netto.dk OR site:rema1000.dk OR site:lidl.dk OR site:365discount.coop.dk OR site:brugsen.coop.dk OR site:kvickly.coop.dk OR site:superbrugsen.coop.dk OR site:meny.dk OR site:dagrofa.dk OR site:motatos.dk OR site:normal.dk OR site:almamad.dk",
-      "DE" => "site:rewe.de OR site:kaufland.de",
-      "AT" => "site:rewe.de OR site:kaufland.de",
+      "DE" => "site:rewe.de OR site:kaufland.de OR site:edeka.de OR site:dm.de",
+      "AT" => "site:rewe.de OR site:kaufland.de OR site:billa.at OR site:interspar.at",
       "ES" => "site:carrefour.es OR site:alcampo.es OR site:hipercor.es",
       "IT" => "site:cosicomodo.it OR site:carrefour.it OR site:spesasicura.com OR site:conad.it OR site:esselunga.it"
     }
@@ -60,15 +61,10 @@ class ImageHunter
     country_name = @country_names[market] || ""
     lang_code = @country_langs[market] || "en"
     
-    # 1. VISUAL HUNT
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
-    
-    # 2. DATA HUNT
     data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
-    # 3. MERGE
-    final_result = image_result.merge(data_result)
-    return final_result
+    return image_result.merge(data_result)
   end
 
   # --- PART 1: VISUAL HUNTER ---
@@ -76,12 +72,7 @@ class ImageHunter
     if EAN_SEARCH_TOKEN
       api_data = check_ean_api(gtin) 
       if api_data && is_good?(api_data[:image])
-        return { 
-          found: true, 
-          url: api_data[:image], 
-          source: "https://www.ean-search.org/?q=#{gtin}",
-          product_name: api_data[:name] 
-        }
+        return { found: true, url: api_data[:image], source: "https://www.ean-search.org/?q=#{gtin}", product_name: api_data[:name] }
       end
     end
 
@@ -103,15 +94,18 @@ class ImageHunter
     keywords = @local_keywords[market] || "Ingredients Nutrition"
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
 
+    # STRATEGY 1: GOOGLE SHOPPING (Best for Specs)
     shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
     return shopping_data unless shopping_data[:ingredients] == "-"
 
+    # STRATEGY 2: GOLDMINE SITES (Trusted Retailers)
     goldmine = @data_sources[market]
     if goldmine
       data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
     end
     
+    # STRATEGY 3: BRAND SEARCH
     if product_name
       data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
@@ -122,9 +116,7 @@ class ImageHunter
 
   def run_shopping_search(query, market, lang_code)
     begin
-      search = GoogleSearch.new(
-        q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
-      )
+      search = GoogleSearch.new(q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY)
       res = search.get_hash
       big_text_blob = ""
       (res[:shopping_results] || []).first(3).each do |item|
@@ -138,9 +130,7 @@ class ImageHunter
 
   def run_text_search(query, market, lang_code)
     begin
-      search = GoogleSearch.new(
-        q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
-      )
+      search = GoogleSearch.new(q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY)
       res = search.get_hash
       big_text_blob = ""
       (res[:organic_results] || []).first(6).each do |item|
@@ -152,26 +142,22 @@ class ImageHunter
     end
   end
 
-  # --- FIXED PARSER ---
+  # --- PARSING ENGINE ---
   def extract_all_data(text_blob)
     text_blob = text_blob.gsub(/\s+/, " ").gsub("|", " ")
 
-    # We use (?:...) for non-capturing groups on the labels, so they don't mess up our match index
-    
+    # Non-capturing groups (?:) to avoid messing up the match count
     ing_regex = /(?:ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(?:nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
-    
     nutri_regex = /(?:per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
-
     allergen_regex = /(?:allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(?:\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
-
     may_regex = /(?:may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(?:\.|nutrition|voedings|$))/i
 
-    # NUMBER FINDER FIX:
-    # We now strictly look for the capturing group (\d+...) which is Group 1 because the Label is (?:...) non-capturing
+    # THE FIX: We capture the UNIT separately (Group 2) and use it in the output.
+    # Group 1: The Number | Group 2: The Unit
     find_val = ->(keywords, units) {
-       regex = /#{keywords}[^0-9]{0,25}([<>]?\s*\d+[,\.]?\d*)\s*#{units}/i
+       regex = /#{keywords}[^0-9]{0,12}([<>]?\s*\d+(?:[,\.]\d+)?)\s*(#{units})/i
        match = text_blob.match(regex)
-       match ? "#{match[1]}#{units}" : "-"
+       match ? "#{match[1]} #{match[2]}" : "-"
     }
 
     data = {
@@ -189,7 +175,6 @@ class ImageHunter
       protein: find_val.call("(?:protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)", "g"),
       fiber: find_val.call("(?:fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)", "g"),
       salt: find_val.call("(?:salt|salz|zout|sel|sale|sal|sól)", "g"),
-      
       organic_cert: extract_text(text_blob, /([A-Z]{2}-(?:BIO|ÖKO|ORG)-\d+)/i)
     }
     return data
@@ -198,7 +183,6 @@ class ImageHunter
   def extract_text(text, regex)
     match = text.match(regex)
     return "-" unless match
-    # For text lists, we grab the first capturing group because we used (?:...) for labels
     value = match[1]
     return "-" if value.nil? || value.strip.empty?
     return value[0..400].strip 
