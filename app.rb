@@ -11,9 +11,9 @@ set :bind, '0.0.0.0'
 set :port, 8080
 
 # --- API KEYS ---
-# It looks for keys in the Cloud Environment variables
-SERPAPI_KEY = ENV['ec844167f2087ea0badd97a0024f4a149bbfb3c78eadd2f13cf57b7cc09fce8e'] 
-EAN_SEARCH_TOKEN = ENV['ff351707851a33db53564e109f2bd54cb56d5951']
+# It looks for keys in the Cloud Environment variables by their NAME, not their value.
+SERPAPI_KEY = ENV['SERPAPI_KEY'] 
+EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
 # --- THE LOGIC CLASS (The Hunter) ---
 class ImageHunter
