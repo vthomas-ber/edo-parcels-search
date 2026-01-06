@@ -88,7 +88,12 @@ class MasterDataHunter
 
   def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
-    model_id = "gemini-2.5-flash-lite" 
+    
+    # --- FIXED: USING STANDARD STABLE MODEL ---
+    # gemini-2.5-flash-lite has a 20 request/day limit.
+    # gemini-2.0-flash-001 is the standard stable version with higher limits.
+    model_id = "gemini-2.0-flash-001" 
+    
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
@@ -136,7 +141,6 @@ class MasterDataHunter
       }]
     }
 
-    # --- BACKEND RETRY (Safety Net) ---
     retries = 0
     max_retries = 3
     
@@ -144,19 +148,29 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: body.to_json, headers: @headers)
         
+        # 1. HANDLE 429 (RATE LIMIT)
         if response.code == 429
           if retries < max_retries
-            sleep_time = 20 # Wait 20 seconds on backend if hit
+            sleep_time = (retries + 1) * 10
             puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
             next
           else
-            return { error: "API Rate Limit Exceeded (429)." }
+            return { error: "API Daily/Rate Limit Exceeded." }
           end
         end
 
+        # 2. HANDLE OTHER ERRORS
         if response.code != 200
+          # Auto-fallback if the user doesn't have access to 2.0-flash-001
+          if model_id == "gemini-2.0-flash-001"
+             puts "⚠️ Model 2.0-flash-001 not found. Switching to gemini-flash-latest..."
+             model_id = "gemini-flash-latest"
+             url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+             retries = 0
+             next
+          end
           return { error: "API #{response.code}: #{response.message}" }
         end
 
@@ -314,7 +328,7 @@ __END__
         
         let displayStatus = data.status;
         let statusClass = 'status-found';
-        if (data.status.includes("Error") || data.status.includes("Missing")) {
+        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("429")) {
            statusClass = 'status-missing';
         }
 
@@ -351,11 +365,10 @@ __END__
       }
       processed++;
       
-      // --- THE CRITICAL FIX: FRONTEND THROTTLE ---
-      // Wait 10 seconds between items to stay under 15 Requests/Min limit
+      // We still keep a small delay just to be safe
       if (processed < lines.length) {
-        document.getElementById('statusText').innerText = `Cooling down (10s) to avoid API limit...`;
-        await new Promise(r => setTimeout(r, 10000));
+        document.getElementById('statusText').innerText = `Cooling down (5s)...`;
+        await new Promise(r => setTimeout(r, 5000));
       }
     }
     document.getElementById('startBtn').disabled = false;
