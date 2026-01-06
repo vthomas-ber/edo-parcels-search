@@ -7,15 +7,14 @@ require 'base64'
 require 'httparty'
 
 # --- CONFIGURATION ---
-# ⚠️ MAKE SURE THIS KEY IS COPIED CORRECTLY
+# ⚠️ PASTE YOUR KEY HERE
 GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
+# --- THE AI CLASS ---
 class MasterDataHunter
   include HTTParty
-  # Using the latest stable model endpoint
-  base_uri 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
@@ -26,21 +25,38 @@ class MasterDataHunter
       "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish", 
       "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
+    
+    # RUN DIAGNOSTIC ON STARTUP
+    check_available_models
+  end
+
+  # --- DIAGNOSTIC TOOL ---
+  def check_available_models
+    puts "\n🔌 Connecting to Google to check API Key and Models..."
+    url = "https://generativelanguage.googleapis.com/v1beta/models?key=#{GEMINI_API_KEY}"
+    response = HTTParty.get(url)
+    
+    if response.code == 200
+      puts "✅ API Key is Valid! Available Models:"
+      models = JSON.parse(response.body)["models"] || []
+      models.each { |m| puts "   - #{m['name']}" }
+    else
+      puts "❌ API Key Error: #{response.code} - #{response.message}"
+      puts "   Details: #{response.body}"
+    end
+    puts "--------------------------------------------------\n"
   end
 
   def process_product(gtin, market)
     image_data = find_best_image(gtin, market)
     return empty_result(gtin, market, "No Image Found") unless image_data
 
-    # Call Gemini
     ai_result = analyze_with_gemini(image_data[:base64], gtin, market)
     
-    # If AI failed, return the error message in the status
     if ai_result[:error]
-      return empty_result(gtin, market, "AI Error: #{ai_result[:error]}", image_data[:url], image_data[:source])
+      return empty_result(gtin, market, ai_result[:error], image_data[:url], image_data[:source])
     end
 
-    # Success! Merge everything
     return {
       found: true,
       gtin: gtin,
@@ -58,7 +74,6 @@ class MasterDataHunter
     return nil unless SERPAPI_KEY
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
-    # Search Strategy
     query = "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
@@ -81,7 +96,9 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # EXACT GEM INSTRUCTIONS
+    # Use explicit full URL to avoid 404s
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=#{GEMINI_API_KEY}"
+    
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher. 
       CORE DIRECTIVE: Accuracy is your priority. Look at this product image.
@@ -122,11 +139,13 @@ class MasterDataHunter
       }]
     }
 
-    # Make Request
-    response = self.class.post("?key=#{GEMINI_API_KEY}", body: body.to_json, headers: @headers)
+    response = HTTParty.post(url, body: body.to_json, headers: @headers)
     
-    # DEBUG: Check if request failed
     if response.code != 200
+      # If 1.5 Flash fails, fallback to Pro
+      if response.code == 404
+         return { error: "Model 404. Check logs for available models." }
+      end
       return { error: "API #{response.code}: #{response.message}" }
     end
 
@@ -143,7 +162,6 @@ class MasterDataHunter
     {
       found: false, status: status_msg, gtin: gtin, market: market,
       image_url: img_url, source_url: src_url,
-      # Fill all keys to prevent "undefined"
       product_name: "-", weight: "-", ingredients: "-", allergens: "-",
       may_contain: "-", nutri_scope: "-", energy: "-", fat: "-",
       saturates: "-", carbs: "-", sugars: "-", protein: "-",
@@ -280,7 +298,6 @@ __END__
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
         
-        // Logic to display errors in the status column
         let displayStatus = data.status;
         let statusClass = 'status-found';
         if (data.status.includes("Error") || data.status.includes("Missing")) {
