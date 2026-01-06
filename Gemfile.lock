@@ -4,12 +4,21 @@ GEM
     addressable (2.8.8)
       public_suffix (>= 2.0.2, < 8.0)
     base64 (0.3.0)
+    bigdecimal (4.0.1)
+    csv (3.3.5)
     down (5.4.2)
       addressable (~> 2.8)
     fastimage (2.4.0)
     google_search_results (2.2.0)
+    httparty (0.24.0)
+      csv
+      mini_mime (>= 1.0.0)
+      multi_xml (>= 0.5.2)
     json (2.18.0)
     logger (1.7.0)
+    mini_mime (1.1.5)
+    multi_xml (0.8.0)
+      bigdecimal (>= 3.1, < 5)
     mustermann (3.0.4)
       ruby2_keywords (~> 0.0.1)
     nio4r (2.7.5)
@@ -44,6 +53,7 @@ DEPENDENCIES
   down
   fastimage
   google_search_results
+  httparty
   json
   puma
   rackup

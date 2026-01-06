@@ -1,9 +1,10 @@
 source 'https://rubygems.org'
 
 gem 'sinatra'
-gem 'puma'                # <--- CRITICAL: This is the engine
-gem 'rackup'              # <--- CRITICAL: This is the key
+gem 'puma'
+gem 'rackup'
 gem 'google_search_results'
 gem 'down'
 gem 'fastimage'
 gem 'json'
+gem 'httparty' # <--- NEW: For easy API calls to Gemini

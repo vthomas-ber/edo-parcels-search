@@ -3,269 +3,146 @@ require 'google_search_results'
 require 'down'
 require 'fastimage'
 require 'json'
-require 'net/http'
-require 'uri'
+require 'base64'
+require 'httparty'
 
-# --- API KEYS ---
+# --- CONFIGURATION ---
+# ⚠️ PASTE YOUR KEY HERE
+GEMINI_API_KEY = ENV['GEMINI_API_KEY']
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
-# --- THE LOGIC CLASS ---
-class ImageHunter
+# --- THE AI CLASS ---
+class MasterDataHunter
+  include HTTParty
+  base_uri 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
+
   def initialize
-    @country_names = {
-      "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
-      "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
-      "IT" => "Italia Italy", "ES" => "España Spain", "PL" => "Polska Poland",
-      "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique België Belgium",
-      "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal"
-    }
-    
+    @headers = { 'Content-Type' => 'application/json' }
     @country_langs = {
-      "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
-      "FR" => "fr", "BE" => "fr", "IT" => "it", "ES" => "es", "PL" => "pl",
-      "DK" => "da", "NL" => "nl", "SE" => "sv", "NO" => "no", "PT" => "pt"
+      "DE" => "German", "AT" => "German", "CH" => "German",
+      "UK" => "English", "GB" => "English", "FR" => "French", 
+      "BE" => "French", "IT" => "Italian", "ES" => "Spanish", 
+      "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish", 
+      "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
+  end
+
+  def process_product(gtin, market)
+    # 1. FIND THE IMAGE (Strictly Verified Sources Only)
+    image_data = find_best_image(gtin, market)
     
-    @local_keywords = {
-      "DE" => "Zutaten Nährwerte", "AT" => "Zutaten Nährwerte", "CH" => "Zutaten Nährwerte",
-      "UK" => "Ingredients Nutrition", "GB" => "Ingredients Nutrition",
-      "FR" => "Ingrédients Nutrition", "BE" => "Ingrédients Nutrition",
-      "NL" => "Ingrediënten Voedingswaarden", 
-      "IT" => "Ingredienti Nutrizionali",
-      "ES" => "Ingredientes Nutrición",
-      "DK" => "Ingredienser Næringsindhold",
-      "SE" => "Ingredienser Näringsvärde",
-      "NO" => "Ingredienser Næringsinnhold",
-      "PL" => "Składniki Wartość odżywcza",
-      "PT" => "Ingredientes Nutrição"
-    }
+    # If no image found, return "Missing" status but keep structure
+    return empty_result(gtin, market) unless image_data
 
-    # TEAM TRUSTED SOURCES (The Goldmine)
-    # Added missing markets (SE, NO, PL, PT) to ensure 100% coverage
-    @data_sources = {
-      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:courses.monoprix.fr OR site:labellevie.com OR site:chronodrive.com OR site:intermarche.com OR site:houra.fr OR site:bamcourses.com OR site:franprix.fr OR site:clic-shopping.com OR site:willyantigaspi.fr OR site:beansclub.fr",
-      
-      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:groceries.morrisons.com OR site:iceland.co.uk OR site:aldi.co.uk OR site:poundland.co.uk OR site:marksandspencer.com OR site:amazon.co.uk OR site:bmstores.co.uk OR site:heronfoods.com OR site:poundstretcher.co.uk OR site:home.bargains OR site:therange.co.uk OR site:lowpricefoods.com OR site:approvedfood.co.uk OR site:discountdragon.co.uk OR site:productlibrary.brandbank.com OR site:nutricircle.co.uk",
-      
-      "NL" => "site:ah.nl OR site:jumbo.com OR site:lidl.nl OR site:dirk.nl OR site:vomar.nl OR site:aldi.nl OR site:goflink.com OR site:picnic.app OR site:foodello.nl OR site:amazon.nl OR site:kruidvat.nl",
-      
-      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be OR site:foodello.be OR site:amazon.com.be OR site:bol.com OR site:psinfoodservice.com OR site:checker.thequestionmark.org",
-      
-      "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:netto.dk OR site:rema1000.dk OR site:lidl.dk OR site:365discount.coop.dk OR site:brugsen.coop.dk OR site:kvickly.coop.dk OR site:superbrugsen.coop.dk OR site:meny.dk OR site:dagrofa.dk OR site:motatos.dk OR site:normal.dk OR site:almamad.dk",
-      
-      "DE" => "site:rewe.de OR site:kaufland.de OR site:edeka.de OR site:dm.de",
-      "AT" => "site:rewe.de OR site:kaufland.de OR site:billa.at OR site:interspar.at",
-      
-      "ES" => "site:carrefour.es OR site:alcampo.es OR site:hipercor.es OR site:dia.es",
-      "IT" => "site:cosicomodo.it OR site:carrefour.it OR site:spesasicura.com OR site:conad.it OR site:esselunga.it",
-      
-      # Added these to ensure complete coverage:
-      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se",
-      "NO" => "site:oda.com OR site:meny.no OR site:spar.no",
-      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl",
-      "PT" => "site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt"
-    }
-  end
-
-  def find_image(gtin, market)
-    return { found: false } if gtin.nil? || gtin.strip.empty?
-    market = market.upcase
-    country_name = @country_names[market] || ""
-    lang_code = @country_langs[market] || "en"
+    # 2. ASK GEMINI (Read the Image)
+    ai_data = analyze_with_gemini(image_data[:base64], gtin, market)
     
-    # 1. VISUAL HUNT (Get Image + Product Name)
-    image_result = hunt_visuals(gtin, market, country_name, lang_code)
-    
-    # 2. DATA HUNT (Prioritize Trusted Sites)
-    data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
-
-    # 3. MERGE
-    final_result = image_result.merge(data_result)
-    return final_result
-  end
-
-  # --- PART 1: VISUAL HUNTER ---
-  def hunt_visuals(gtin, market, country_name, lang_code)
-    if EAN_SEARCH_TOKEN
-      api_data = check_ean_api(gtin) 
-      if api_data && is_good?(api_data[:image])
-        return { 
-          found: true, 
-          url: api_data[:image], 
-          source: "https://www.ean-search.org/?q=#{gtin}", 
-          product_name: api_data[:name] 
-        }
-      end
-    end
-
-    site_res = search_google_images("site:barcodelookup.com \"#{gtin}\"", market, lang_code)
-    return site_res if site_res
-
-    strict_res = search_google_images("\"#{gtin}\" #{country_name}", market, lang_code)
-    return strict_res if strict_res
-
-    broad_res = search_google_images("\"#{gtin}\"", market, lang_code)
-    return broad_res if broad_res
-
-    return { found: false, url: "", source: "" }
-  end
-
-  # --- PART 2: DATA HUNTER (High Precision Logic) ---
-  def hunt_data(gtin, market, lang_code, product_name)
-    return empty_data_set unless SERPAPI_KEY
-    keywords = @local_keywords[market] || "Ingredients Nutrition"
-    bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
-    goldmine = @data_sources[market]
-
-    # STRATEGY 1: GOLDMINE SEARCH (Trusted Sites ONLY)
-    if goldmine
-      # A. Try GTIN on Trusted Sites
-      data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
-      return data unless data[:ingredients] == "-"
-
-      # B. Try PRODUCT NAME on Trusted Sites (Fallback if GTIN fails)
-      # Many supermarkets don't index EANs, but they do index "Lipton Ice Tea"
-      if product_name
-        # Clean name: remove weird characters to help search
-        clean_name = product_name.gsub(/[^a-zA-Z0-9\s]/, '') 
-        data = run_text_search("#{goldmine} #{clean_name} #{keywords} #{bans}", market, lang_code)
-        return data unless data[:ingredients] == "-"
-      end
-    end
-
-    # STRATEGY 2: GOOGLE SHOPPING (Back-up)
-    # If trusted sites failed, we try Google Shopping
-    shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
-    return shopping_data unless shopping_data[:ingredients] == "-"
-    
-    # STRATEGY 3: BROAD BRAND SEARCH (Last Resort)
-    if product_name
-      data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
-      return data unless data[:ingredients] == "-"
-    end
-    
-    return empty_data_set
-  end
-
-  def run_shopping_search(query, market, lang_code)
-    begin
-      search = GoogleSearch.new(
-        q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
-      )
-      res = search.get_hash
-      big_text_blob = ""
-      (res[:shopping_results] || []).first(3).each do |item|
-        big_text_blob += " " + (item[:title] || "") + " " + (item[:snippet] || "") + " " + (item[:description] || "")
-      end
-      return extract_all_data(big_text_blob)
-    rescue
-      return empty_data_set
-    end
-  end
-
-  def run_text_search(query, market, lang_code)
-    begin
-      search = GoogleSearch.new(
-        q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
-      )
-      res = search.get_hash
-      big_text_blob = ""
-      (res[:organic_results] || []).first(6).each do |item|
-        big_text_blob += " " + (item[:snippet] || "")
-      end
-      return extract_all_data(big_text_blob)
-    rescue
-      return empty_data_set
-    end
-  end
-
-  # --- PARSING ENGINE ---
-  def extract_all_data(text_blob)
-    text_blob = text_blob.gsub(/\s+/, " ").gsub("|", " ")
-
-    ing_regex = /(?:ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(?:nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
-    nutri_regex = /(?:per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
-    allergen_regex = /(?:allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(?:\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
-    may_regex = /(?:may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(?:\.|nutrition|voedings|$))/i
-
-    find_val = ->(keywords, units) {
-       regex = /#{keywords}[^0-9]{0,12}([<>]?\s*\d+(?:[,\.]\d+)?)\s*(#{units})/i
-       match = text_blob.match(regex)
-       match ? "#{match[1]} #{match[2]}" : "-"
-    }
-
-    data = {
-      weight: find_val.call("(?:weight|gewicht|inhoud|netto|poids|size|peso|vikt|waga)", "(?:g|kg|ml|l|oz|cl)"),
-      ingredients: extract_text(text_blob, ing_regex),
-      allergens: extract_text(text_blob, allergen_regex),
-      may_contain: extract_text(text_blob, may_regex),
-      nutrition_header: extract_text(text_blob, nutri_regex),
-      
-      energy: find_val.call("(?:energy|energie|valeur|valor|energi|energia)", "(?:kj|kcal)"),
-      fat: find_val.call("(?:fat|fett|vet|matières grasses|grassi|grasas|fedt|tłuszcz)", "g"),
-      saturates: find_val.call("(?:saturates|saturated|gesättigte|verzadigde|saturés|saturi|saturadas|mættede|nasycone)", "g"),
-      carbs: find_val.call("(?:carbohydrate|kohlenhydrate|koolhydraten|glucides|carboidrati|hidratos|kulhydrat|węglowodany)", "g"),
-      sugars: find_val.call("(?:sugars|zucker|suikers|sucres|zuccheri|azúcares|sukker|socker|cukry)", "g"),
-      protein: find_val.call("(?:protein|eiweiß|eiwit|protéines|proteine|proteínas|białko)", "g"),
-      fiber: find_val.call("(?:fiber|ballaststoffe|vezels|fibres|fibre|fibra|kostfibre|błonnik)", "g"),
-      salt: find_val.call("(?:salt|salz|zout|sel|sale|sal|sól)", "g"),
-      organic_cert: extract_text(text_blob, /([A-Z]{2}-(?:BIO|ÖKO|ORG)-\d+)/i)
-    }
-    return data
-  end
-
-  def extract_text(text, regex)
-    match = text.match(regex)
-    return "-" unless match
-    value = match[1]
-    return "-" if value.nil? || value.strip.empty?
-    return value[0..400].strip 
-  end
-
-  def empty_data_set
-    { 
-      weight: "-", ingredients: "-", allergens: "-", may_contain: "-", nutrition_header: "-",
-      energy: "-", fat: "-", saturates: "-", carbs: "-", sugars: "-", protein: "-", fiber: "-", salt: "-", organic_cert: "-"
+    # 3. MERGE RESULTS
+    return {
+      found: true,
+      gtin: gtin,
+      status: "Found",
+      market: market,
+      image_url: image_data[:url],
+      source_url: image_data[:source], # <--- This is your "Source / Variants" link
+      # AI Data Fields
+      **ai_data
     }
   end
 
-  def check_ean_api(gtin)
-    url = URI("https://api.ean-search.org/api?token=#{EAN_SEARCH_TOKEN}&op=barcode-lookup&ean=#{gtin}&format=json")
-    response = Net::HTTP.get(url)
-    data = JSON.parse(response) rescue []
-    product = data.first
-    return nil unless product
-    { image: product["image"], name: product["name"] }
-  rescue
-    nil
-  end
+  private
 
-  def search_google_images(query, gl, hl)
+  def find_best_image(gtin, market)
     return nil unless SERPAPI_KEY
-    res = GoogleSearch.new(q: query, tbm: "isch", gl: gl.downcase, hl: hl, api_key: SERPAPI_KEY).get_hash
-    (res[:images_results] || []).first(10).each do |img|
+    
+    # STRICT BAN LIST: Exclude UGC and Open Databases
+    bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
+    
+    # Strategy 1: Targeted "Goldmine" Search (Best Quality)
+    query = "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\""
+    res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+    
+    # Strategy 2: Broad Retailer Search (Fallback)
+    if (res[:images_results] || []).empty?
+      res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+    end
+
+    (res[:images_results] || []).first(5).each do |img|
       url = img[:original]
-      source = img[:link]
-      next if url.include?("pinterest") || url.include?("ebay") || url.include?("openfoodfacts")
-      if is_good?(url)
-        return { found: true, url: url, source: source, product_name: img[:title] }
+      # Technical Check: Ensure image is valid and not a tiny icon
+      next if url.include?("placeholder")
+      
+      begin
+        # Download and encode for AI
+        tempfile = Down.download(url, max_size: 5 * 1024 * 1024)
+        base64 = Base64.strict_encode64(File.read(tempfile.path))
+        return { url: url, source: img[:link], base64: base64 }
+      rescue
+        next
       end
     end
     nil
-  rescue
-    nil
   end
 
-  def is_good?(url)
-    return false if url.nil? || url.empty?
-    options = { timeout: 4, http_header: { 'User-Agent' => 'Chrome/90.0' } }
-    size = FastImage.size(url, options)
-    return false unless size
-    w, h = size
-    return w > 300 && (w.to_f / h.to_f).between?(0.3, 2.5)
-  rescue
-    false
+  def analyze_with_gemini(base64_image, gtin, market)
+    target_lang = @country_langs[market] || "English"
+    
+    # INSTRUCTIONS: Exactly matches your needs
+    prompt_text = <<~TEXT
+      You are a Master Data Expert. Look at this product image.
+      CORE TASK: Extract product specifications.
+      LANGUAGE RULE: Translate ALL text into #{target_lang}.
+      
+      REQUIRED JSON FORMAT:
+      {
+        "product_name": "Brand + Name",
+        "weight": "Net weight (e.g. 500g) or -",
+        "ingredients": "Full list as single string or -",
+        "allergens": "List of allergens or -",
+        "may_contain": "May contain warnings or -",
+        "nutri_scope": "Header (e.g. per 100g) or -",
+        "energy": "Energy in kJ / kcal or -",
+        "fat": "Total Fat value or -",
+        "saturates": "Saturated Fat value or -",
+        "carbs": "Carbohydrates value or -",
+        "sugars": "Sugars value or -",
+        "protein": "Protein value or -",
+        "fiber": "Fiber value or -",
+        "salt": "Salt value or -",
+        "organic_id": "Certification code (e.g. DE-ÖKO-001) or -"
+      }
+    TEXT
+
+    body = {
+      contents: [{
+        parts: [
+          { text: prompt_text },
+          { inline_data: { mime_type: "image/jpeg", data: base64_image } }
+        ]
+      }]
+    }
+
+    response = self.class.post("?key=#{GEMINI_API_KEY}", body: body.to_json, headers: @headers)
+    
+    begin
+      raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
+      clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
+      return JSON.parse(clean_json)
+    rescue
+      return { product_name: "AI Error", ingredients: "-" }
+    end
+  end
+
+  def empty_result(gtin, market)
+    {
+      found: false, status: "Missing", gtin: gtin, market: market,
+      image_url: nil, source_url: nil,
+      product_name: "-", weight: "-", ingredients: "-", allergens: "-",
+      may_contain: "-", nutri_scope: "-", energy: "-", fat: "-",
+      saturates: "-", carbs: "-", sugars: "-", protein: "-",
+      fiber: "-", salt: "-", organic_id: "-"
+    }
   end
 end
 
@@ -277,8 +154,8 @@ end
 
 get '/api/search' do
   content_type :json
-  hunter = ImageHunter.new
-  result = hunter.find_image(params[:gtin], params[:market])
+  hunter = MasterDataHunter.new
+  result = hunter.process_product(params[:gtin], params[:market])
   result.to_json
 end
 
@@ -288,35 +165,36 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG Master Data Hunter</title>
+  <title>TGTG AI Data Hunter</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; padding: 20px; color: #333; }
-    .container { max-width: 95%; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
-    h1 { color: #00816A; margin-top: 0; }
-    .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; background: #eefcf9; padding: 15px; border-radius: 8px; }
-    textarea { width: 100%; height: 100px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font-family: monospace; }
-    button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
+    .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    h1 { color: #00816A; }
+    
+    .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #eefcf9; padding: 15px; border-radius: 8px; }
+    textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-family: monospace; }
+    button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: 600; cursor: pointer; }
     button:disabled { background: #ccc; }
     
-    .table-wrapper { overflow-x: auto; margin-top: 20px; border: 1px solid #eee; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2000px; }
-    th { text-align: left; background: #00816A; color: white; padding: 10px; white-space: nowrap; position: sticky; left: 0; }
-    td { padding: 10px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; word-wrap: break-word; }
-    tr:nth-child(even) { background: #f9f9f9; }
+    .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #eee; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2200px; }
+    th { text-align: left; background: #00816A; color: white; padding: 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; }
+    td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 250px; word-wrap: break-word; }
+    tr:nth-child(even) { background: #f8f9fa; }
     
-    .status-found { color: #28a745; font-weight: bold; }
-    .status-missing { color: #dc3545; font-weight: bold; }
-    .img-preview { max-height: 60px; max-width: 60px; object-fit: contain; }
-    .source-link { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+    .status-found { background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .status-missing { background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; }
+    .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; }
+    .link-btn:hover { background: #00816A; color: white; }
   </style>
 </head>
 <body>
 
 <div class="container">
-  <h1>🍏 TGTG Master Data Hunter</h1>
+  <h1>✨ TGTG AI Master Data Hunter</h1>
   <div class="controls">
-    <label><strong>Market:</strong></label>
-    <select id="marketSelect">
+    <select id="marketSelect" style="padding: 8px; border-radius: 4px;">
       <option value="DE">Germany (DE)</option>
       <option value="UK">United Kingdom (UK)</option>
       <option value="FR">France (FR)</option>
@@ -326,33 +204,31 @@ __END__
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
       <option value="SE">Sweden (SE)</option>
+      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
-      <option value="NO">Norway (NO)</option>
-      <option value="AT">Austria (AT)</option>
     </select>
   </div>
 
-  <textarea id="inputList" placeholder="Paste GTINs here..."></textarea>
+  <textarea id="inputList" placeholder="Paste EANs here..."></textarea>
   <br><br>
-  <button id="startBtn">🚀 Start Data Hunt</button>
+  <button id="startBtn" onclick="startBatch()">🚀 Start AI Analysis</button>
   <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download CSV</button>
-  
-  <p id="statusText">Ready.</p>
+  <p id="statusText" style="color: #666; margin-top: 10px;">Ready.</p>
 
   <div class="table-wrapper">
     <table id="resultsTable">
       <thead>
         <tr>
-          <th>GTIN</th>
+          <th>EAN</th>
           <th>Product Name</th>
           <th>Status</th>
           <th>Image</th>
-          <th>Weight</th>
+          <th>Source / Variants</th>
           <th>Ingredients</th>
           <th>Allergens</th>
           <th>May Contain</th>
-          <th>Nutri Header</th>
+          <th>Nutritional Scope</th>
           <th>Energy</th>
           <th>Fat</th>
           <th>Saturates</th>
@@ -362,7 +238,7 @@ __END__
           <th>Fiber</th>
           <th>Salt</th>
           <th>Organic ID</th>
-          <th>Source</th>
+          <th>Source (Food Info)</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -372,7 +248,6 @@ __END__
 
 <script>
   let resultsData = [];
-  document.getElementById('startBtn').addEventListener('click', startBatch);
 
   async function startBatch() {
     const text = document.getElementById('inputList').value;
@@ -389,26 +264,31 @@ __END__
     let processed = 0;
 
     for (const gtin of lines) {
-      document.getElementById('statusText').innerText = `Hunting ${gtin} (${processed + 1}/${lines.length})...`;
+      document.getElementById('statusText').innerText = `Analyzing ${gtin} (${processed + 1}/${lines.length})...`;
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<17; i++) { emptyCells += "<td></td>"; }
-      tr.innerHTML = `<td>${gtin}</td><td style="color:orange">Loading...</td>` + emptyCells;
+      let emptyCells = ""; for(let i=0; i<18; i++) { emptyCells += "<td></td>"; }
+      tr.innerHTML = `<td>${gtin}</td><td style="color:#00816A">🤖 Thinking...</td>` + emptyCells;
       tbody.appendChild(tr);
 
       try {
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
         
+        const statusHTML = data.found ? `<span class="status-found">Found</span>` : `<span class="status-missing">Missing</span>`;
+        const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
+        const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
+        const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify</a>` : '-';
+
         tr.innerHTML = `
           <td>${gtin}</td>
-          <td>${(data.product_name || '-').substring(0,30)}...</td>
-          <td class="${data.found ? 'status-found' : 'status-missing'}">${data.found ? 'Found' : 'Missing'}</td>
-          <td>${data.url ? `<img src="${data.url}" class="img-preview">` : '❌'}</td>
-          <td>${data.weight}</td>
-          <td>${(data.ingredients || '-').substring(0, 50)}...</td>
+          <td>${data.product_name}</td>
+          <td>${statusHTML}</td>
+          <td>${imgHTML}</td>
+          <td>${sourceLink}</td>
+          <td>${data.ingredients}</td>
           <td>${data.allergens}</td>
           <td>${data.may_contain}</td>
-          <td>${data.nutrition_header}</td>
+          <td>${data.nutri_scope}</td>
           <td>${data.energy}</td>
           <td>${data.fat}</td>
           <td>${data.saturates}</td>
@@ -417,10 +297,10 @@ __END__
           <td>${data.protein}</td>
           <td>${data.fiber}</td>
           <td>${data.salt}</td>
-          <td>${data.organic_cert}</td>
-          <td>${data.source ? `<a href="${data.source}" target="_blank" class="source-link">Link</a>` : '-'}</td>
+          <td>${data.organic_id}</td>
+          <td>${infoLink}</td>
         `;
-        resultsData.push({ ...data, gtin, market, status: data.found ? 'Found' : 'Missing' });
+        resultsData.push(data);
       } catch (e) { 
         tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td>` + emptyCells;
       }
@@ -432,14 +312,20 @@ __END__
   }
 
   function downloadCSV() {
-    let csv = "GTIN,ProductName,Market,Status,ImageURL,SourceURL,Weight,Ingredients,Allergens,MayContain,NutritionHeader,Energy,Fat,Saturates,Carbohydrates,Sugars,Protein,Fiber,Salt,OrganicID\n";
+    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID,FoodInfoSource\n";
+    
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
-      csv += `${row.gtin},${clean(row.product_name)},${row.market},${row.status},${row.url},${row.source},${clean(row.weight)},${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},${clean(row.nutrition_header)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},${clean(row.salt)},${clean(row.organic_cert)}\n`;
+      csv += `${row.gtin},${clean(row.product_name)},${row.status},${row.image_url},${row.source_url},` +
+             `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
+             `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},` +
+             `${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},` +
+             `${clean(row.salt)},${clean(row.organic_id)},${row.source_url}\n`;
     });
+    
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
-    link.download = "tgtg_master_data.csv";
+    link.download = "tgtg_ai_results.csv";
     link.click();
   }
 </script>
