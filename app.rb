@@ -5,6 +5,7 @@ require 'fastimage'
 require 'json'
 require 'base64'
 require 'httparty'
+require 'nokogiri' # <--- NEW: For parsing website text
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
@@ -26,10 +27,15 @@ class MasterDataHunter
   end
 
   def process_product(gtin, market)
+    # 1. FIND IMAGE & SOURCE
     image_data = find_best_image(gtin, market)
-    return empty_result(gtin, market, "No Image Found") unless image_data
+    return empty_result(gtin, market, "No Data Found") unless image_data
 
-    ai_result = analyze_with_gemini(image_data[:base64], gtin, market)
+    # 2. FETCH WEBSITE TEXT (The New "Reading" Ability)
+    website_text = fetch_website_text(image_data[:source])
+
+    # 3. SEND EVERYTHING TO GEMINI
+    ai_result = analyze_with_gemini(image_data[:base64], website_text, gtin, market)
     
     if ai_result[:error]
       return empty_result(gtin, market, ai_result[:error], image_data[:url], image_data[:source])
@@ -52,7 +58,8 @@ class MasterDataHunter
     return nil unless SERPAPI_KEY
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
-    query = "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\""
+    # Priority: Trusted Retailers
+    query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
     if (res[:images_results] || []).empty?
@@ -71,41 +78,62 @@ class MasterDataHunter
     nil
   end
 
-  def analyze_with_gemini(base64_image, gtin, market)
+  def fetch_website_text(url)
+    return "" if url.nil? || url.empty?
+    begin
+      # Fake a browser User-Agent to avoid getting blocked
+      html = HTTParty.get(url, headers: {"User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}).body
+      doc = Nokogiri::HTML(html)
+      
+      # Remove scripts and styles to save tokens
+      doc.css('script, style, nav, footer').remove
+      
+      # Return the clean text (limit to 2000 chars to fit context window)
+      return doc.text.gsub(/\s+/, " ").strip[0..5000]
+    rescue
+      return "" # If site blocks us, we just return empty string and rely on image
+    end
+  end
+
+  def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
-    
-    # UPDATED: Using the exact model ID found in your logs
     model_id = "gemini-2.5-flash-lite" 
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
-      You are the Lead Food Product Researcher. 
-      CORE DIRECTIVE: Accuracy is your priority. Look at this product image.
+      You are the Lead Food Product Researcher.
       
-      PHASE 1: EXTRACTION
-      Extract the following details. If a field is not explicitly visible in the image, strictly write "-".
+      INPUT DATA:
+      1. PRODUCT IMAGE (Attached)
+      2. WEBSITE TEXT SCRAPED FROM SOURCE:
+      """
+      #{website_text}
+      """
       
-      PHASE 2: LOCALIZATION
-      Translate ALL text output (Ingredients, Product Name, Allergens) into #{target_lang}.
+      CORE TASK: 
+      Combine visual data from the image AND text data from the website to complete the specification.
+      If the image is just a "Front of Pack", rely on the website text for Ingredients/Nutrition.
       
-      PHASE 3: OUTPUT FORMAT
-      Return strictly valid JSON with these keys:
+      PHASE 1: LOCALIZATION
+      Translate ALL text output into #{target_lang}.
+      
+      PHASE 2: OUTPUT FORMAT (Strict JSON):
       {
         "product_name": "Brand + Product Name",
-        "weight": "Net Weight (e.g. 500g)",
-        "ingredients": "Full ingredients list as single string (no newlines)",
+        "weight": "Net Weight",
+        "ingredients": "Full ingredients list (single string)",
         "allergens": "List of allergens",
         "may_contain": "May contain warnings",
         "nutri_scope": "Header (e.g. per 100g)",
-        "energy": "Energy in kJ / kcal",
-        "fat": "Fat value with unit",
-        "saturates": "Saturated Fat value with unit",
-        "carbs": "Carbohydrates value with unit",
-        "sugars": "Sugars value with unit",
-        "protein": "Protein value with unit",
-        "fiber": "Fiber value with unit",
-        "salt": "Salt value with unit",
-        "organic_id": "Organic Code (e.g. DE-ÖKO-001)"
+        "energy": "Energy (kJ / kcal)",
+        "fat": "Fat value",
+        "saturates": "Saturated Fat",
+        "carbs": "Carbohydrates",
+        "sugars": "Sugars",
+        "protein": "Protein",
+        "fiber": "Fiber",
+        "salt": "Salt",
+        "organic_id": "Organic Code"
       }
     TEXT
 
@@ -121,7 +149,7 @@ class MasterDataHunter
     response = HTTParty.post(url, body: body.to_json, headers: @headers)
     
     if response.code != 200
-      return { error: "API #{response.code}: #{response.message} (Model: #{model_id})" }
+      return { error: "API #{response.code}: #{response.message}" }
     end
 
     begin
@@ -129,7 +157,7 @@ class MasterDataHunter
       clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
       return JSON.parse(clean_json)
     rescue => e
-      return { error: "JSON Parse Error: #{e.message}" }
+      return { error: "JSON Parse Error" }
     end
   end
 
@@ -176,16 +204,17 @@ __END__
     button:disabled { background: #ccc; }
     
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #eee; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2200px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2400px; }
     th { text-align: left; background: #00816A; color: white; padding: 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 250px; word-wrap: break-word; }
     tr:nth-child(even) { background: #f8f9fa; }
     
     .status-found { background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .status-missing { background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
-    .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; }
-    .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; }
+    .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
+    .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; display: inline-block; margin-top: 2px;}
     .link-btn:hover { background: #00816A; color: white; }
+    .dl-link { font-weight: bold; text-decoration: underline; color: #333; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -219,11 +248,12 @@ __END__
     <table id="resultsTable">
       <thead>
         <tr>
+          <th>Status</th>
+          <th>Image Preview</th>
+          <th>Download Image</th>
+          <th>Source / Variants</th>
           <th>EAN</th>
           <th>Product Name</th>
-          <th>Status</th>
-          <th>Image</th>
-          <th>Source / Variants</th>
           <th>Ingredients</th>
           <th>Allergens</th>
           <th>May Contain</th>
@@ -237,7 +267,6 @@ __END__
           <th>Fiber</th>
           <th>Salt</th>
           <th>Organic ID</th>
-          <th>Source (Food Info)</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -265,8 +294,8 @@ __END__
     for (const gtin of lines) {
       document.getElementById('statusText').innerText = `Analyzing ${gtin} (${processed + 1}/${lines.length})...`;
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<18; i++) { emptyCells += "<td></td>"; }
-      tr.innerHTML = `<td>${gtin}</td><td style="color:#00816A">🤖 Thinking...</td>` + emptyCells;
+      let emptyCells = ""; for(let i=0; i<16; i++) { emptyCells += "<td></td>"; }
+      tr.innerHTML = `<td style="color:#00816A; font-weight:bold;">Thinking...</td>` + emptyCells;
       tbody.appendChild(tr);
 
       try {
@@ -280,15 +309,16 @@ __END__
         }
 
         const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
+        const dlLink = data.image_url ? `<a href="${data.image_url}" target="_blank" class="link-btn">⬇️ View Full</a>` : '-';
         const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
-        const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify</a>` : '-';
 
         tr.innerHTML = `
-          <td>${gtin}</td>
-          <td>${data.product_name}</td>
           <td><span class="${statusClass}">${displayStatus}</span></td>
           <td>${imgHTML}</td>
+          <td>${dlLink}</td>
           <td>${sourceLink}</td>
+          <td>${gtin}</td>
+          <td>${data.product_name}</td>
           <td>${data.ingredients}</td>
           <td>${data.allergens}</td>
           <td>${data.may_contain}</td>
@@ -302,11 +332,10 @@ __END__
           <td>${data.fiber}</td>
           <td>${data.salt}</td>
           <td>${data.organic_id}</td>
-          <td>${infoLink}</td>
         `;
         resultsData.push(data);
       } catch (e) { 
-        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Critical JS Error</td>` + emptyCells;
+        tr.innerHTML = `<td style="color:red">Error</td>` + emptyCells;
       }
       processed++;
     }
@@ -316,7 +345,7 @@ __END__
   }
 
   function downloadCSV() {
-    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID,FoodInfoSource\n";
+    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID\n";
     
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
@@ -324,7 +353,7 @@ __END__
              `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
              `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},` +
              `${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},` +
-             `${clean(row.salt)},${clean(row.organic_id)},${row.source_url}\n`;
+             `${clean(row.salt)},${clean(row.organic_id)}\n`;
     });
     
     const link = document.createElement("a");
