@@ -7,14 +7,14 @@ require 'base64'
 require 'httparty'
 
 # --- CONFIGURATION ---
-# ⚠️ PASTE YOUR KEY HERE
-GEMINI_API_KEY = ENV['GEMINI_API_KEY']
+# ⚠️ MAKE SURE THIS KEY IS COPIED CORRECTLY
+GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
-# --- THE AI CLASS ---
 class MasterDataHunter
   include HTTParty
+  # Using the latest stable model endpoint
   base_uri 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
 
   def initialize
@@ -29,25 +29,26 @@ class MasterDataHunter
   end
 
   def process_product(gtin, market)
-    # 1. FIND THE IMAGE (Strictly Verified Sources Only)
     image_data = find_best_image(gtin, market)
-    
-    # If no image found, return "Missing" status but keep structure
-    return empty_result(gtin, market) unless image_data
+    return empty_result(gtin, market, "No Image Found") unless image_data
 
-    # 2. ASK GEMINI (Read the Image)
-    ai_data = analyze_with_gemini(image_data[:base64], gtin, market)
+    # Call Gemini
+    ai_result = analyze_with_gemini(image_data[:base64], gtin, market)
     
-    # 3. MERGE RESULTS
+    # If AI failed, return the error message in the status
+    if ai_result[:error]
+      return empty_result(gtin, market, "AI Error: #{ai_result[:error]}", image_data[:url], image_data[:source])
+    end
+
+    # Success! Merge everything
     return {
       found: true,
       gtin: gtin,
       status: "Found",
       market: market,
       image_url: image_data[:url],
-      source_url: image_data[:source], # <--- This is your "Source / Variants" link
-      # AI Data Fields
-      **ai_data
+      source_url: image_data[:source],
+      **ai_result
     }
   end
 
@@ -55,32 +56,24 @@ class MasterDataHunter
 
   def find_best_image(gtin, market)
     return nil unless SERPAPI_KEY
-    
-    # STRICT BAN LIST: Exclude UGC and Open Databases
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
-    # Strategy 1: Targeted "Goldmine" Search (Best Quality)
+    # Search Strategy
     query = "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
-    # Strategy 2: Broad Retailer Search (Fallback)
     if (res[:images_results] || []).empty?
       res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     end
 
     (res[:images_results] || []).first(5).each do |img|
       url = img[:original]
-      # Technical Check: Ensure image is valid and not a tiny icon
       next if url.include?("placeholder")
-      
       begin
-        # Download and encode for AI
         tempfile = Down.download(url, max_size: 5 * 1024 * 1024)
         base64 = Base64.strict_encode64(File.read(tempfile.path))
         return { url: url, source: img[:link], base64: base64 }
-      rescue
-        next
-      end
+      rescue; next; end
     end
     nil
   end
@@ -88,29 +81,35 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # INSTRUCTIONS: Exactly matches your needs
+    # EXACT GEM INSTRUCTIONS
     prompt_text = <<~TEXT
-      You are a Master Data Expert. Look at this product image.
-      CORE TASK: Extract product specifications.
-      LANGUAGE RULE: Translate ALL text into #{target_lang}.
+      You are the Lead Food Product Researcher. 
+      CORE DIRECTIVE: Accuracy is your priority. Look at this product image.
       
-      REQUIRED JSON FORMAT:
+      PHASE 1: EXTRACTION
+      Extract the following details. If a field is not explicitly visible in the image, strictly write "-".
+      
+      PHASE 2: LOCALIZATION
+      Translate ALL text output (Ingredients, Product Name, Allergens) into #{target_lang}.
+      
+      PHASE 3: OUTPUT FORMAT
+      Return strictly valid JSON with these keys:
       {
-        "product_name": "Brand + Name",
-        "weight": "Net weight (e.g. 500g) or -",
-        "ingredients": "Full list as single string or -",
-        "allergens": "List of allergens or -",
-        "may_contain": "May contain warnings or -",
-        "nutri_scope": "Header (e.g. per 100g) or -",
-        "energy": "Energy in kJ / kcal or -",
-        "fat": "Total Fat value or -",
-        "saturates": "Saturated Fat value or -",
-        "carbs": "Carbohydrates value or -",
-        "sugars": "Sugars value or -",
-        "protein": "Protein value or -",
-        "fiber": "Fiber value or -",
-        "salt": "Salt value or -",
-        "organic_id": "Certification code (e.g. DE-ÖKO-001) or -"
+        "product_name": "Brand + Product Name",
+        "weight": "Net Weight (e.g. 500g)",
+        "ingredients": "Full ingredients list as single string (no newlines)",
+        "allergens": "List of allergens",
+        "may_contain": "May contain warnings",
+        "nutri_scope": "Header (e.g. per 100g)",
+        "energy": "Energy in kJ / kcal",
+        "fat": "Fat value with unit",
+        "saturates": "Saturated Fat value with unit",
+        "carbs": "Carbohydrates value with unit",
+        "sugars": "Sugars value with unit",
+        "protein": "Protein value with unit",
+        "fiber": "Fiber value with unit",
+        "salt": "Salt value with unit",
+        "organic_id": "Organic Code (e.g. DE-ÖKO-001)"
       }
     TEXT
 
@@ -123,21 +122,28 @@ class MasterDataHunter
       }]
     }
 
+    # Make Request
     response = self.class.post("?key=#{GEMINI_API_KEY}", body: body.to_json, headers: @headers)
     
+    # DEBUG: Check if request failed
+    if response.code != 200
+      return { error: "API #{response.code}: #{response.message}" }
+    end
+
     begin
       raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
       clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
       return JSON.parse(clean_json)
-    rescue
-      return { product_name: "AI Error", ingredients: "-" }
+    rescue => e
+      return { error: "JSON Parse Error: #{e.message}" }
     end
   end
 
-  def empty_result(gtin, market)
+  def empty_result(gtin, market, status_msg, img_url=nil, src_url=nil)
     {
-      found: false, status: "Missing", gtin: gtin, market: market,
-      image_url: nil, source_url: nil,
+      found: false, status: status_msg, gtin: gtin, market: market,
+      image_url: img_url, source_url: src_url,
+      # Fill all keys to prevent "undefined"
       product_name: "-", weight: "-", ingredients: "-", allergens: "-",
       may_contain: "-", nutri_scope: "-", energy: "-", fat: "-",
       saturates: "-", carbs: "-", sugars: "-", protein: "-",
@@ -274,7 +280,13 @@ __END__
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
         
-        const statusHTML = data.found ? `<span class="status-found">Found</span>` : `<span class="status-missing">Missing</span>`;
+        // Logic to display errors in the status column
+        let displayStatus = data.status;
+        let statusClass = 'status-found';
+        if (data.status.includes("Error") || data.status.includes("Missing")) {
+           statusClass = 'status-missing';
+        }
+
         const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
         const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
         const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify</a>` : '-';
@@ -282,7 +294,7 @@ __END__
         tr.innerHTML = `
           <td>${gtin}</td>
           <td>${data.product_name}</td>
-          <td>${statusHTML}</td>
+          <td><span class="${statusClass}">${displayStatus}</span></td>
           <td>${imgHTML}</td>
           <td>${sourceLink}</td>
           <td>${data.ingredients}</td>
@@ -302,7 +314,7 @@ __END__
         `;
         resultsData.push(data);
       } catch (e) { 
-        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Error</td>` + emptyCells;
+        tr.innerHTML = `<td>${gtin}</td><td style="color:red">Critical JS Error</td>` + emptyCells;
       }
       processed++;
     }
