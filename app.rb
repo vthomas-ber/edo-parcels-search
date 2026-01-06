@@ -34,7 +34,7 @@ class MasterDataHunter
     # 2. FETCH WEBSITE TEXT
     website_text = fetch_website_text(image_data[:source])
 
-    # 3. SEND TO GEMINI (With Auto-Retry)
+    # 3. SEND TO GEMINI (With Fixed Loop Logic)
     ai_result = analyze_with_gemini(image_data[:base64], website_text, gtin, market)
     
     if ai_result[:error]
@@ -139,36 +139,40 @@ class MasterDataHunter
       }]
     }
 
-    # --- SMART RETRY LOGIC ---
+    # --- FIXED LOOP LOGIC FOR RETRIES ---
     retries = 0
     max_retries = 3
     
-    begin
-      response = HTTParty.post(url, body: body.to_json, headers: @headers)
-      
-      # If Rate Limited (429), Wait and Retry
-      if response.code == 429
-        if retries < max_retries
-          sleep_time = (retries + 1) * 5 # Wait 5s, 10s, 15s
-          puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
-          sleep(sleep_time)
-          retries += 1
-          retry
-        else
-          return { error: "API Rate Limit Exceeded (429). Please wait." }
+    loop do
+      begin
+        response = HTTParty.post(url, body: body.to_json, headers: @headers)
+        
+        # 1. HANDLE RATE LIMIT (429)
+        if response.code == 429
+          if retries < max_retries
+            sleep_time = (retries + 1) * 2 # Wait 2s, 4s, 6s
+            puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
+            sleep(sleep_time)
+            retries += 1
+            next # Restart the loop
+          else
+            return { error: "API Rate Limit Exceeded (429)." }
+          end
         end
-      end
 
-      if response.code != 200
-        return { error: "API #{response.code}: #{response.message}" }
-      end
+        # 2. HANDLE OTHER ERRORS
+        if response.code != 200
+          return { error: "API #{response.code}: #{response.message}" }
+        end
 
-      raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
-      clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
-      return JSON.parse(clean_json)
-      
-    rescue => e
-      return { error: "JSON Parse Error" }
+        # 3. SUCCESS - PARSE JSON
+        raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
+        clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
+        return JSON.parse(clean_json)
+        
+      rescue => e
+        return { error: "JSON Parse Error" }
+      end
     end
   end
 
@@ -225,7 +229,6 @@ __END__
     .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
     .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; display: inline-block; margin-top: 2px;}
     .link-btn:hover { background: #00816A; color: white; }
-    .dl-link { font-weight: bold; text-decoration: underline; color: #333; cursor: pointer; }
   </style>
 </head>
 <body>
