@@ -89,8 +89,11 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # 1. TRY STABLE GEMINI 2.0 (High Limits)
-    model_id = "gemini-2.0-flash" 
+    # --- CRITICAL FIX: FORCE GEMINI 1.5 FLASH ---
+    # This is the production model with 1,500 requests/day limit.
+    # Do NOT use 2.5, 3.0, or "Lite" models as they are limited to 20/day.
+    model_id = "gemini-1.5-flash" 
+    
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
@@ -145,10 +148,10 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: body.to_json, headers: @headers)
         
-        # 1. HANDLE RATE LIMIT (429)
+        # 1. HANDLE 429 (RATE LIMIT)
         if response.code == 429
           if retries < max_retries
-            sleep_time = (retries + 1) * 5
+            sleep_time = (retries + 1) * 10
             puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
@@ -158,13 +161,17 @@ class MasterDataHunter
           end
         end
 
-        # 2. HANDLE MODEL NOT FOUND (404) -> Fallback
-        if response.code == 404 && model_id == "gemini-2.0-flash"
-             puts "⚠️ Gemini 2.0 not found. Switching to Gemini 1.5 Flash..."
-             model_id = "gemini-1.5-flash"
-             url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
-             retries = 0
-             next
+        # 2. HANDLE MODEL NOT FOUND (404)
+        if response.code == 404
+             # If 1.5 is missing, try "flash-latest" alias
+             if model_id == "gemini-1.5-flash"
+               puts "⚠️ Gemini 1.5 not found. Trying 'gemini-flash-latest'..."
+               model_id = "gemini-flash-latest"
+               url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+               retries = 0
+               next
+             end
+             return { error: "Model Not Found. Create a new Google Cloud Project." }
         end
 
         if response.code != 200
@@ -362,7 +369,7 @@ __END__
       }
       processed++;
       
-      // Keep strict 5s delay to remain well within safe limits for stable models
+      // Keep strict 5s delay
       if (processed < lines.length) {
         document.getElementById('statusText').innerText = `Cooling down (5s)...`;
         await new Promise(r => setTimeout(r, 5000));
