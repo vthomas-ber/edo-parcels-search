@@ -34,7 +34,7 @@ class MasterDataHunter
     # 2. FETCH WEBSITE TEXT
     website_text = fetch_website_text(image_data[:source])
 
-    # 3. SEND EVERYTHING TO GEMINI
+    # 3. SEND TO GEMINI (With Auto-Retry)
     ai_result = analyze_with_gemini(image_data[:base64], website_text, gtin, market)
     
     if ai_result[:error]
@@ -58,7 +58,6 @@ class MasterDataHunter
     return nil unless SERPAPI_KEY
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
-    # Priority: Trusted Retailers
     query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
@@ -81,7 +80,7 @@ class MasterDataHunter
   def fetch_website_text(url)
     return "" if url.nil? || url.empty?
     begin
-      html = HTTParty.get(url, headers: {"User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}).body
+      html = HTTParty.get(url, headers: {"User-Agent" => "Mozilla/5.0"}).body
       doc = Nokogiri::HTML(html)
       doc.css('script, style, nav, footer').remove
       return doc.text.gsub(/\s+/, " ").strip[0..5000]
@@ -92,7 +91,6 @@ class MasterDataHunter
 
   def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
-    # UPDATED MODEL ID
     model_id = "gemini-2.5-flash-lite" 
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
@@ -141,16 +139,34 @@ class MasterDataHunter
       }]
     }
 
-    response = HTTParty.post(url, body: body.to_json, headers: @headers)
+    # --- SMART RETRY LOGIC ---
+    retries = 0
+    max_retries = 3
     
-    if response.code != 200
-      return { error: "API #{response.code}: #{response.message}" }
-    end
-
     begin
+      response = HTTParty.post(url, body: body.to_json, headers: @headers)
+      
+      # If Rate Limited (429), Wait and Retry
+      if response.code == 429
+        if retries < max_retries
+          sleep_time = (retries + 1) * 5 # Wait 5s, 10s, 15s
+          puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
+          sleep(sleep_time)
+          retries += 1
+          retry
+        else
+          return { error: "API Rate Limit Exceeded (429). Please wait." }
+        end
+      end
+
+      if response.code != 200
+        return { error: "API #{response.code}: #{response.message}" }
+      end
+
       raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
       clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
       return JSON.parse(clean_json)
+      
     rescue => e
       return { error: "JSON Parse Error" }
     end
@@ -209,6 +225,7 @@ __END__
     .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
     .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; display: inline-block; margin-top: 2px;}
     .link-btn:hover { background: #00816A; color: white; }
+    .dl-link { font-weight: bold; text-decoration: underline; color: #333; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -306,7 +323,6 @@ __END__
         const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
         const dlLink = data.image_url ? `<a href="${data.image_url}" target="_blank" class="link-btn">⬇️ View Full</a>` : '-';
         const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
-        // NEW: Explicitly rendering the Food Info Source link
         const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify Data</a>` : '-';
 
         tr.innerHTML = `
