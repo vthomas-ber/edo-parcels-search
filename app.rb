@@ -7,12 +7,10 @@ require 'base64'
 require 'httparty'
 
 # --- CONFIGURATION ---
-# ⚠️ PASTE YOUR KEY HERE
 GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
-# --- THE AI CLASS ---
 class MasterDataHunter
   include HTTParty
 
@@ -25,26 +23,6 @@ class MasterDataHunter
       "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish", 
       "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
-    
-    # RUN DIAGNOSTIC ON STARTUP
-    check_available_models
-  end
-
-  # --- DIAGNOSTIC TOOL ---
-  def check_available_models
-    puts "\n🔌 Connecting to Google to check API Key and Models..."
-    url = "https://generativelanguage.googleapis.com/v1beta/models?key=#{GEMINI_API_KEY}"
-    response = HTTParty.get(url)
-    
-    if response.code == 200
-      puts "✅ API Key is Valid! Available Models:"
-      models = JSON.parse(response.body)["models"] || []
-      models.each { |m| puts "   - #{m['name']}" }
-    else
-      puts "❌ API Key Error: #{response.code} - #{response.message}"
-      puts "   Details: #{response.body}"
-    end
-    puts "--------------------------------------------------\n"
   end
 
   def process_product(gtin, market)
@@ -96,8 +74,9 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # Use explicit full URL to avoid 404s
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=#{GEMINI_API_KEY}"
+    # UPDATED: Using the exact model ID found in your logs
+    model_id = "gemini-2.5-flash-lite" 
+    url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher. 
@@ -142,11 +121,7 @@ class MasterDataHunter
     response = HTTParty.post(url, body: body.to_json, headers: @headers)
     
     if response.code != 200
-      # If 1.5 Flash fails, fallback to Pro
-      if response.code == 404
-         return { error: "Model 404. Check logs for available models." }
-      end
-      return { error: "API #{response.code}: #{response.message}" }
+      return { error: "API #{response.code}: #{response.message} (Model: #{model_id})" }
     end
 
     begin
