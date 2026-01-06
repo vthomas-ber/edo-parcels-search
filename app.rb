@@ -89,11 +89,8 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- FIXED: USING STANDARD STABLE MODEL ---
-    # gemini-2.5-flash-lite has a 20 request/day limit.
-    # gemini-2.0-flash-001 is the standard stable version with higher limits.
-    model_id = "gemini-2.0-flash-001" 
-    
+    # 1. TRY STABLE GEMINI 2.0 (High Limits)
+    model_id = "gemini-2.0-flash" 
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
@@ -148,29 +145,29 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: body.to_json, headers: @headers)
         
-        # 1. HANDLE 429 (RATE LIMIT)
+        # 1. HANDLE RATE LIMIT (429)
         if response.code == 429
           if retries < max_retries
-            sleep_time = (retries + 1) * 10
+            sleep_time = (retries + 1) * 5
             puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
             next
           else
-            return { error: "API Daily/Rate Limit Exceeded." }
+            return { error: "API Daily Limit Exceeded." }
           end
         end
 
-        # 2. HANDLE OTHER ERRORS
-        if response.code != 200
-          # Auto-fallback if the user doesn't have access to 2.0-flash-001
-          if model_id == "gemini-2.0-flash-001"
-             puts "⚠️ Model 2.0-flash-001 not found. Switching to gemini-flash-latest..."
-             model_id = "gemini-flash-latest"
+        # 2. HANDLE MODEL NOT FOUND (404) -> Fallback
+        if response.code == 404 && model_id == "gemini-2.0-flash"
+             puts "⚠️ Gemini 2.0 not found. Switching to Gemini 1.5 Flash..."
+             model_id = "gemini-1.5-flash"
              url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
              retries = 0
              next
-          end
+        end
+
+        if response.code != 200
           return { error: "API #{response.code}: #{response.message}" }
         end
 
@@ -365,7 +362,7 @@ __END__
       }
       processed++;
       
-      // We still keep a small delay just to be safe
+      // Keep strict 5s delay to remain well within safe limits for stable models
       if (processed < lines.length) {
         document.getElementById('statusText').innerText = `Cooling down (5s)...`;
         await new Promise(r => setTimeout(r, 5000));
