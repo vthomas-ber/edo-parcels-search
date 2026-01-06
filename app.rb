@@ -150,7 +150,7 @@ class MasterDataHunter
         # 1. HANDLE RATE LIMIT (429)
         if response.code == 429
           if retries < max_retries
-            sleep_time = (retries + 1) * 2 # Wait 2s, 4s, 6s
+            sleep_time = (retries + 1) * 10 # Wait 15s, 25s, 35s
             puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
