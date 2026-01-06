@@ -42,16 +42,29 @@ class ImageHunter
     }
 
     # TEAM TRUSTED SOURCES (The Goldmine)
+    # Added missing markets (SE, NO, PL, PT) to ensure 100% coverage
     @data_sources = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:courses.monoprix.fr OR site:labellevie.com OR site:chronodrive.com OR site:intermarche.com OR site:houra.fr OR site:bamcourses.com OR site:franprix.fr OR site:clic-shopping.com OR site:willyantigaspi.fr OR site:beansclub.fr",
+      
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:groceries.morrisons.com OR site:iceland.co.uk OR site:aldi.co.uk OR site:poundland.co.uk OR site:marksandspencer.com OR site:amazon.co.uk OR site:bmstores.co.uk OR site:heronfoods.com OR site:poundstretcher.co.uk OR site:home.bargains OR site:therange.co.uk OR site:lowpricefoods.com OR site:approvedfood.co.uk OR site:discountdragon.co.uk OR site:productlibrary.brandbank.com OR site:nutricircle.co.uk",
+      
       "NL" => "site:ah.nl OR site:jumbo.com OR site:lidl.nl OR site:dirk.nl OR site:vomar.nl OR site:aldi.nl OR site:goflink.com OR site:picnic.app OR site:foodello.nl OR site:amazon.nl OR site:kruidvat.nl",
+      
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be OR site:foodello.be OR site:amazon.com.be OR site:bol.com OR site:psinfoodservice.com OR site:checker.thequestionmark.org",
+      
       "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:netto.dk OR site:rema1000.dk OR site:lidl.dk OR site:365discount.coop.dk OR site:brugsen.coop.dk OR site:kvickly.coop.dk OR site:superbrugsen.coop.dk OR site:meny.dk OR site:dagrofa.dk OR site:motatos.dk OR site:normal.dk OR site:almamad.dk",
+      
       "DE" => "site:rewe.de OR site:kaufland.de OR site:edeka.de OR site:dm.de",
       "AT" => "site:rewe.de OR site:kaufland.de OR site:billa.at OR site:interspar.at",
-      "ES" => "site:carrefour.es OR site:alcampo.es OR site:hipercor.es",
-      "IT" => "site:cosicomodo.it OR site:carrefour.it OR site:spesasicura.com OR site:conad.it OR site:esselunga.it"
+      
+      "ES" => "site:carrefour.es OR site:alcampo.es OR site:hipercor.es OR site:dia.es",
+      "IT" => "site:cosicomodo.it OR site:carrefour.it OR site:spesasicura.com OR site:conad.it OR site:esselunga.it",
+      
+      # Added these to ensure complete coverage:
+      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se",
+      "NO" => "site:oda.com OR site:meny.no OR site:spar.no",
+      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl",
+      "PT" => "site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt"
     }
   end
 
@@ -61,10 +74,15 @@ class ImageHunter
     country_name = @country_names[market] || ""
     lang_code = @country_langs[market] || "en"
     
+    # 1. VISUAL HUNT (Get Image + Product Name)
     image_result = hunt_visuals(gtin, market, country_name, lang_code)
+    
+    # 2. DATA HUNT (Prioritize Trusted Sites)
     data_result = hunt_data(gtin, market, lang_code, image_result[:product_name])
 
-    return image_result.merge(data_result)
+    # 3. MERGE
+    final_result = image_result.merge(data_result)
+    return final_result
   end
 
   # --- PART 1: VISUAL HUNTER ---
@@ -72,7 +90,12 @@ class ImageHunter
     if EAN_SEARCH_TOKEN
       api_data = check_ean_api(gtin) 
       if api_data && is_good?(api_data[:image])
-        return { found: true, url: api_data[:image], source: "https://www.ean-search.org/?q=#{gtin}", product_name: api_data[:name] }
+        return { 
+          found: true, 
+          url: api_data[:image], 
+          source: "https://www.ean-search.org/?q=#{gtin}", 
+          product_name: api_data[:name] 
+        }
       end
     end
 
@@ -88,24 +111,35 @@ class ImageHunter
     return { found: false, url: "", source: "" }
   end
 
-  # --- PART 2: DATA HUNTER ---
+  # --- PART 2: DATA HUNTER (High Precision Logic) ---
   def hunt_data(gtin, market, lang_code, product_name)
     return empty_data_set unless SERPAPI_KEY
     keywords = @local_keywords[market] || "Ingredients Nutrition"
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:wikipedia.org"
-
-    # STRATEGY 1: GOOGLE SHOPPING (Best for Specs)
-    shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
-    return shopping_data unless shopping_data[:ingredients] == "-"
-
-    # STRATEGY 2: GOLDMINE SITES (Trusted Retailers)
     goldmine = @data_sources[market]
+
+    # STRATEGY 1: GOLDMINE SEARCH (Trusted Sites ONLY)
     if goldmine
+      # A. Try GTIN on Trusted Sites
       data = run_text_search("#{goldmine} #{gtin} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
+
+      # B. Try PRODUCT NAME on Trusted Sites (Fallback if GTIN fails)
+      # Many supermarkets don't index EANs, but they do index "Lipton Ice Tea"
+      if product_name
+        # Clean name: remove weird characters to help search
+        clean_name = product_name.gsub(/[^a-zA-Z0-9\s]/, '') 
+        data = run_text_search("#{goldmine} #{clean_name} #{keywords} #{bans}", market, lang_code)
+        return data unless data[:ingredients] == "-"
+      end
     end
+
+    # STRATEGY 2: GOOGLE SHOPPING (Back-up)
+    # If trusted sites failed, we try Google Shopping
+    shopping_data = run_shopping_search("#{gtin} #{bans}", market, lang_code)
+    return shopping_data unless shopping_data[:ingredients] == "-"
     
-    # STRATEGY 3: BRAND SEARCH
+    # STRATEGY 3: BROAD BRAND SEARCH (Last Resort)
     if product_name
       data = run_text_search("#{product_name} #{keywords} #{bans}", market, lang_code)
       return data unless data[:ingredients] == "-"
@@ -116,7 +150,9 @@ class ImageHunter
 
   def run_shopping_search(query, market, lang_code)
     begin
-      search = GoogleSearch.new(q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY)
+      search = GoogleSearch.new(
+        q: query, tbm: "shop", gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
+      )
       res = search.get_hash
       big_text_blob = ""
       (res[:shopping_results] || []).first(3).each do |item|
@@ -130,7 +166,9 @@ class ImageHunter
 
   def run_text_search(query, market, lang_code)
     begin
-      search = GoogleSearch.new(q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY)
+      search = GoogleSearch.new(
+        q: query, gl: market.downcase, hl: lang_code, lr: "lang_#{lang_code}", api_key: SERPAPI_KEY
+      )
       res = search.get_hash
       big_text_blob = ""
       (res[:organic_results] || []).first(6).each do |item|
@@ -146,14 +184,11 @@ class ImageHunter
   def extract_all_data(text_blob)
     text_blob = text_blob.gsub(/\s+/, " ").gsub("|", " ")
 
-    # Non-capturing groups (?:) to avoid messing up the match count
     ing_regex = /(?:ingredients|zutaten|ingrédients|ingrediënten|samenstelling|ingredienser|ingredientes|ingredienti|składniki)\s*[:\.-]?\s*(.*?)(?=(?:nutrition|voedings|nährwerte|energy|energie|valeurs|valor|näring|næring|wartość|$))/i
     nutri_regex = /(?:per 100|pro 100|pour 100|por 100|pr\. 100|w 100)/i
     allergen_regex = /(?:allergens|allergene|allergie|bevat|contains|allergènes|allergenen|allergener|alérgenos|alergeny)\s*[:\.-]?\s*(.*?)(?=(?:\.|may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|$))/i
     may_regex = /(?:may contain|kann spuren|kan sporen|peut contenir|puede contener|kan indeholde|pode conter|può contenere)\s*[:\.-]?\s*(.*?)(?=(?:\.|nutrition|voedings|$))/i
 
-    # THE FIX: We capture the UNIT separately (Group 2) and use it in the output.
-    # Group 1: The Number | Group 2: The Unit
     find_val = ->(keywords, units) {
        regex = /#{keywords}[^0-9]{0,12}([<>]?\s*\d+(?:[,\.]\d+)?)\s*(#{units})/i
        match = text_blob.match(regex)
@@ -292,6 +327,8 @@ __END__
       <option value="DK">Denmark (DK)</option>
       <option value="SE">Sweden (SE)</option>
       <option value="PL">Poland (PL)</option>
+      <option value="PT">Portugal (PT)</option>
+      <option value="NO">Norway (NO)</option>
       <option value="AT">Austria (AT)</option>
     </select>
   </div>
