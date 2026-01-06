@@ -7,4 +7,5 @@ gem 'google_search_results'
 gem 'down'
 gem 'fastimage'
 gem 'json'
-gem 'httparty' # <--- NEW: For easy API calls to Gemini
+gem 'httparty'
+gem 'nokogiri' 
