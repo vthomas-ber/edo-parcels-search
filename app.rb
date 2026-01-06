@@ -5,7 +5,7 @@ require 'fastimage'
 require 'json'
 require 'base64'
 require 'httparty'
-require 'nokogiri' # <--- NEW: For parsing website text
+require 'nokogiri'
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
@@ -31,7 +31,7 @@ class MasterDataHunter
     image_data = find_best_image(gtin, market)
     return empty_result(gtin, market, "No Data Found") unless image_data
 
-    # 2. FETCH WEBSITE TEXT (The New "Reading" Ability)
+    # 2. FETCH WEBSITE TEXT
     website_text = fetch_website_text(image_data[:source])
 
     # 3. SEND EVERYTHING TO GEMINI
@@ -81,22 +81,18 @@ class MasterDataHunter
   def fetch_website_text(url)
     return "" if url.nil? || url.empty?
     begin
-      # Fake a browser User-Agent to avoid getting blocked
       html = HTTParty.get(url, headers: {"User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}).body
       doc = Nokogiri::HTML(html)
-      
-      # Remove scripts and styles to save tokens
       doc.css('script, style, nav, footer').remove
-      
-      # Return the clean text (limit to 2000 chars to fit context window)
       return doc.text.gsub(/\s+/, " ").strip[0..5000]
     rescue
-      return "" # If site blocks us, we just return empty string and rely on image
+      return ""
     end
   end
 
   def analyze_with_gemini(base64_image, website_text, gtin, market)
     target_lang = @country_langs[market] || "English"
+    # UPDATED MODEL ID
     model_id = "gemini-2.5-flash-lite" 
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
@@ -112,7 +108,6 @@ class MasterDataHunter
       
       CORE TASK: 
       Combine visual data from the image AND text data from the website to complete the specification.
-      If the image is just a "Front of Pack", rely on the website text for Ingredients/Nutrition.
       
       PHASE 1: LOCALIZATION
       Translate ALL text output into #{target_lang}.
@@ -204,7 +199,7 @@ __END__
     button:disabled { background: #ccc; }
     
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #eee; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2400px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2600px; }
     th { text-align: left; background: #00816A; color: white; padding: 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 250px; word-wrap: break-word; }
     tr:nth-child(even) { background: #f8f9fa; }
@@ -214,7 +209,6 @@ __END__
     .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
     .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; display: inline-block; margin-top: 2px;}
     .link-btn:hover { background: #00816A; color: white; }
-    .dl-link { font-weight: bold; text-decoration: underline; color: #333; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -267,6 +261,7 @@ __END__
           <th>Fiber</th>
           <th>Salt</th>
           <th>Organic ID</th>
+          <th>Source (Food Info)</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -294,7 +289,7 @@ __END__
     for (const gtin of lines) {
       document.getElementById('statusText').innerText = `Analyzing ${gtin} (${processed + 1}/${lines.length})...`;
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<16; i++) { emptyCells += "<td></td>"; }
+      let emptyCells = ""; for(let i=0; i<17; i++) { emptyCells += "<td></td>"; }
       tr.innerHTML = `<td style="color:#00816A; font-weight:bold;">Thinking...</td>` + emptyCells;
       tbody.appendChild(tr);
 
@@ -311,6 +306,8 @@ __END__
         const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
         const dlLink = data.image_url ? `<a href="${data.image_url}" target="_blank" class="link-btn">⬇️ View Full</a>` : '-';
         const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
+        // NEW: Explicitly rendering the Food Info Source link
+        const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify Data</a>` : '-';
 
         tr.innerHTML = `
           <td><span class="${statusClass}">${displayStatus}</span></td>
@@ -332,6 +329,7 @@ __END__
           <td>${data.fiber}</td>
           <td>${data.salt}</td>
           <td>${data.organic_id}</td>
+          <td>${infoLink}</td>
         `;
         resultsData.push(data);
       } catch (e) { 
@@ -345,7 +343,7 @@ __END__
   }
 
   function downloadCSV() {
-    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID\n";
+    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID,FoodInfoSource\n";
     
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
@@ -353,7 +351,7 @@ __END__
              `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
              `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},` +
              `${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},` +
-             `${clean(row.salt)},${clean(row.organic_id)}\n`;
+             `${clean(row.salt)},${clean(row.organic_id)},${row.source_url}\n`;
     });
     
     const link = document.createElement("a");
