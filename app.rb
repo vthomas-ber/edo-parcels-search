@@ -8,7 +8,8 @@ require 'httparty'
 require 'nokogiri'
 
 # --- CONFIGURATION ---
-GEMINI_API_KEY = ENV['GEMINI_API_KEY'] || "REMOVED_GEMINI_KEY"
+# ⚠️ SECURITY: API Key must be set in Render Environment Variables
+GEMINI_API_KEY = ENV['GEMINI_API_KEY'] 
 SERPAPI_KEY = ENV['SERPAPI_KEY'] 
 EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
 
@@ -17,6 +18,8 @@ class MasterDataHunter
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
+    
+    # 1. MARKET DEFINITIONS
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
       "UK" => "English", "GB" => "English", "FR" => "French", 
@@ -24,18 +27,52 @@ class MasterDataHunter
       "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish", 
       "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
+
+    # 2. THE GOLDMINE (Trusted Retailers)
+    # This ensures we search APPROVED sites first
+    @goldmine_sites = {
+      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr OR site:franprix.fr",
+      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com",
+      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl OR site:vomar.nl",
+      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be",
+      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
+      "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:rema1000.dk OR site:netto.dk",
+      "IT" => "site:carrefour.it OR site:conad.it OR site:esselunga.it OR site:coop.it",
+      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:alcampo.es",
+      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se",
+      "NO" => "site:oda.com OR site:meny.no OR site:spar.no",
+      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl",
+      "PT" => "site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt"
+    }
   end
 
   def process_product(gtin, market)
+    return { found: false, status: "Missing API Key" } unless GEMINI_API_KEY
+
+    # A. IMAGE HUNT (Visuals)
     image_data = find_best_image(gtin, market)
-    return empty_result(gtin, market, "No Data Found") unless image_data
-
-    website_text = fetch_website_text(image_data[:source])
-
-    ai_result = analyze_with_gemini(image_data[:base64], website_text, gtin, market)
     
+    # B. DATA HUNT (Text)
+    # If image search gave us a good source (e.g. BarcodeLookup), read it.
+    # If not, use the "Goldmine" list to find a retailer page.
+    text_source_url = image_data ? image_data[:source] : find_text_source(gtin, market)
+    
+    # C. FETCH CONTENT
+    # We scrape the text from the source we found
+    website_content = fetch_advanced_page_data(text_source_url)
+
+    # D. COMBINE & ANALYZE
+    # Even if no image found, we send the text to Gemini
+    ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
+    
+    # E. FALLBACK: IF IMAGE FAILED (400), RETRY TEXT ONLY
+    if ai_result[:error] && ai_result[:error].include?("400")
+      puts "⚠️ Image rejected. Retrying TEXT ONLY..."
+      ai_result = analyze_with_gemini(nil, website_content, gtin, market)
+    end
+
     if ai_result[:error]
-      return empty_result(gtin, market, ai_result[:error], image_data[:url], image_data[:source])
+      return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil, text_source_url)
     end
 
     return {
@@ -43,8 +80,8 @@ class MasterDataHunter
       gtin: gtin,
       status: "Found",
       market: market,
-      image_url: image_data[:url],
-      source_url: image_data[:source],
+      image_url: image_data ? image_data[:url] : nil,
+      source_url: text_source_url,
       **ai_result
     }
   end
@@ -53,11 +90,14 @@ class MasterDataHunter
 
   def find_best_image(gtin, market)
     return nil unless SERPAPI_KEY
+    # BAN LIST: UGC and Open Databases
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
+    # Priority: High-Res Barcode Sites + Amazon
     query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
+    # Fallback to Broad Search if specific sites fail
     if (res[:images_results] || []).empty?
       res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     end
@@ -74,51 +114,79 @@ class MasterDataHunter
     nil
   end
 
-  def fetch_website_text(url)
+  def find_text_source(gtin, market)
+    return nil unless SERPAPI_KEY
+    goldmine = @goldmine_sites[market]
+    bans = "-site:openfoodfacts.org -site:wikipedia.org"
+    
+    # 1. Try Goldmine (Retailers)
+    if goldmine
+      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+      first_link = (res[:organic_results] || []).first
+      return first_link[:link] if first_link
+    end
+
+    # 2. Try Google Shopping (Fallback)
+    res = GoogleSearch.new(q: "#{gtin}", tbm: "shop", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+    first_shop = (res[:shopping_results] || []).first
+    return first_shop[:link] if first_shop
+    
+    return nil
+  end
+
+  def fetch_advanced_page_data(url)
     return "" if url.nil? || url.empty?
     begin
-      html = HTTParty.get(url, headers: {"User-Agent" => "Mozilla/5.0"}).body
+      user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      response = HTTParty.get(url, headers: {"User-Agent" => user_agent}, timeout: 8)
+      
+      html = response.body
       doc = Nokogiri::HTML(html)
-      doc.css('script, style, nav, footer').remove
-      return doc.text.gsub(/\s+/, " ").strip[0..5000]
+      
+      doc.css('script, style, nav, footer, iframe').remove
+      visual_text = doc.text.gsub(/\s+/, " ").strip[0..4000]
+
+      json_ld_data = ""
+      doc.css('script[type="application/ld+json"]').each do |script|
+        json_ld_data += " " + script.content.gsub(/\s+/, " ").strip[0..2000]
+      end
+
+      return "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD METADATA: #{json_ld_data}"
     rescue
       return ""
     end
   end
 
-  def analyze_with_gemini(base64_image, website_text, gtin, market)
+  def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- CRITICAL FIX: FORCE GEMINI 1.5 FLASH ---
-    # This is the production model with 1,500 requests/day limit.
-    # Do NOT use 2.5, 3.0, or "Lite" models as they are limited to 20/day.
-    model_id = "gemini-1.5-flash" 
-    
+    # --- UNLIMITED MODEL: GEMINI 2.0 FLASH ---
+    model_id = "gemini-2.0-flash" 
     url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
     
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
       
       INPUT DATA:
-      1. PRODUCT IMAGE (Attached)
-      2. WEBSITE TEXT SCRAPED FROM SOURCE:
+      1. WEBSITE CONTENT (Retailer Text + SEO Data):
       """
-      #{website_text}
+      #{page_content}
       """
+      #{base64_image ? "2. PRODUCT IMAGE (Attached)" : "2. IMAGE: None (Text analysis only)"}
       
       CORE TASK: 
-      Combine visual data from the image AND text data from the website to complete the specification.
+      Extract specifications. Prioritize the Website Content if the Image is missing or unclear.
       
-      PHASE 1: LOCALIZATION
-      Translate ALL text output into #{target_lang}.
+      LOCALIZATION RULE:
+      Translate 'Product Name', 'Ingredients', 'Allergens', 'May Contain' into #{target_lang}.
       
-      PHASE 2: OUTPUT FORMAT (Strict JSON):
+      OUTPUT FORMAT (Strict JSON):
       {
         "product_name": "Brand + Product Name",
         "weight": "Net Weight",
-        "ingredients": "Full ingredients list (single string)",
-        "allergens": "List of allergens",
-        "may_contain": "May contain warnings",
+        "ingredients": "Full ingredients list (translated)",
+        "allergens": "List of allergens (translated)",
+        "may_contain": "May contain warnings (translated)",
         "nutri_scope": "Header (e.g. per 100g)",
         "energy": "Energy (kJ / kcal)",
         "fat": "Fat value",
@@ -132,14 +200,12 @@ class MasterDataHunter
       }
     TEXT
 
-    body = {
-      contents: [{
-        parts: [
-          { text: prompt_text },
-          { inline_data: { mime_type: "image/jpeg", data: base64_image } }
-        ]
-      }]
-    }
+    parts = [{ text: prompt_text }]
+    if base64_image
+      parts << { inline_data: { mime_type: "image/jpeg", data: base64_image } }
+    end
+
+    body = { contents: [{ parts: parts }] }
 
     retries = 0
     max_retries = 3
@@ -148,30 +214,17 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: body.to_json, headers: @headers)
         
-        # 1. HANDLE 429 (RATE LIMIT)
+        # RATE LIMIT HANDLING (429)
         if response.code == 429
           if retries < max_retries
-            sleep_time = (retries + 1) * 10
-            puts "⚠️ Rate Limit Hit (429). Sleeping #{sleep_time}s..."
+            sleep_time = (retries + 1) * 5
+            puts "⚠️ Rate Limit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
             next
           else
-            return { error: "API Daily Limit Exceeded." }
+            return { error: "API Busy (429)." }
           end
-        end
-
-        # 2. HANDLE MODEL NOT FOUND (404)
-        if response.code == 404
-             # If 1.5 is missing, try "flash-latest" alias
-             if model_id == "gemini-1.5-flash"
-               puts "⚠️ Gemini 1.5 not found. Trying 'gemini-flash-latest'..."
-               model_id = "gemini-flash-latest"
-               url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
-               retries = 0
-               next
-             end
-             return { error: "Model Not Found. Create a new Google Cloud Project." }
         end
 
         if response.code != 200
@@ -258,8 +311,6 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
-      <option value="SE">Sweden (SE)</option>
-      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
     </select>
@@ -332,7 +383,7 @@ __END__
         
         let displayStatus = data.status;
         let statusClass = 'status-found';
-        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("429")) {
+        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("429") || data.status.includes("403")) {
            statusClass = 'status-missing';
         }
 
@@ -369,10 +420,10 @@ __END__
       }
       processed++;
       
-      // Keep strict 5s delay
+      // Strict 12s delay for safety
       if (processed < lines.length) {
-        document.getElementById('statusText').innerText = `Cooling down (5s)...`;
-        await new Promise(r => setTimeout(r, 5000));
+        document.getElementById('statusText').innerText = `Cooling down (12s)...`;
+        await new Promise(r => setTimeout(r, 12000));
       }
     }
     document.getElementById('startBtn').disabled = false;
