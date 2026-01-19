@@ -8,23 +8,22 @@ require 'httparty'
 require 'nokogiri'
 
 # --- CONFIGURATION ---
-# ⚠️ SECURITY: API Key must be set in Render Environment Variables
-GEMINI_API_KEY = ENV['GEMINI_API_KEY'] 
-SERPAPI_KEY = ENV['SERPAPI_KEY'] 
-EAN_SEARCH_TOKEN = ENV['EAN_SEARCH_TOKEN']
+GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
+SERPAPI_KEY        = ENV['SERPAPI_KEY']
+EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
 
 class MasterDataHunter
   include HTTParty
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
-    
+
     # 1. MARKET DEFINITIONS
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
-      "UK" => "English", "GB" => "English", "FR" => "French", 
-      "BE" => "French", "IT" => "Italian", "ES" => "Spanish", 
-      "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish", 
+      "UK" => "English", "GB" => "English", "FR" => "French",
+      "BE" => "French", "IT" => "Italian", "ES" => "Spanish",
+      "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish",
       "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
 
@@ -46,31 +45,39 @@ class MasterDataHunter
   end
 
   def process_product(gtin, market)
-    return { found: false, status: "Missing API Key" } unless GEMINI_API_KEY
+    if GEMINI_API_KEY.nil? || GEMINI_API_KEY.strip.empty?
+      return { found: false, status: "Missing GEMINI_API_KEY" }
+    end
 
     # A. IMAGE HUNT
     image_data = find_best_image(gtin, market)
-    
+
     # B. DATA HUNT
     text_source_url = image_data ? image_data[:source] : find_text_source(gtin, market)
-    
+
     # C. FETCH CONTENT
     website_content = fetch_advanced_page_data(text_source_url)
 
-    # D. ANALYZE (With Strict List Ladder)
+    # D. ANALYZE
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
-    
-    # E. FALLBACK
-    if ai_result[:error] && ai_result[:error].include?("400")
-      puts "⚠️ Image rejected. Retrying TEXT ONLY..."
+
+    # E. FALLBACK (if image causes 400)
+    if ai_result.is_a?(Hash) && ai_result[:error] && ai_result[:error].include?("API 400")
+      puts "⚠️ Image rejected or bad request. Retrying TEXT ONLY..."
       ai_result = analyze_with_gemini(nil, website_content, gtin, market)
     end
 
-    if ai_result[:error]
-      return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil, text_source_url)
+    if ai_result.is_a?(Hash) && ai_result[:error]
+      return empty_result(
+        gtin,
+        market,
+        ai_result[:error],
+        image_data ? image_data[:url] : nil,
+        text_source_url
+      )
     end
 
-    return {
+    {
       found: true,
       gtin: gtin,
       status: "Found",
@@ -83,98 +90,109 @@ class MasterDataHunter
 
   private
 
+  def serp_gl_for_market(market)
+    # SerpAPI expects gb, not uk
+    return "gb" if market == "UK"
+    market.to_s.downcase
+  end
+
   def find_best_image(gtin, market)
-    return nil unless SERPAPI_KEY
+    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.strip.empty?
+
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
-    
+    gl = serp_gl_for_market(market)
+
     query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
-    res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
-    
+    res = GoogleSearch.new(q: query, tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+
     if (res[:images_results] || []).empty?
-      res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+      res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
     end
 
     (res[:images_results] || []).first(5).each do |img|
       url = img[:original]
-      next if url.include?("placeholder")
+      next if url.nil? || url.include?("placeholder")
+
       begin
         tempfile = Down.download(url, max_size: 5 * 1024 * 1024)
         base64 = Base64.strict_encode64(File.read(tempfile.path))
         return { url: url, source: img[:link], base64: base64 }
-      rescue; next; end
+      rescue
+        next
+      end
     end
+
     nil
   end
 
   def find_text_source(gtin, market)
-    return nil unless SERPAPI_KEY
+    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.strip.empty?
+
     goldmine = @goldmine_sites[market]
     bans = "-site:openfoodfacts.org -site:wikipedia.org"
-    
+    gl = serp_gl_for_market(market)
+
     if goldmine
-      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, api_key: SERPAPI_KEY).get_hash
       first_link = (res[:organic_results] || []).first
       return first_link[:link] if first_link
     end
 
-    res = GoogleSearch.new(q: "#{gtin}", tbm: "shop", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
+    res = GoogleSearch.new(q: "#{gtin}", tbm: "shop", gl: gl, api_key: SERPAPI_KEY).get_hash
     first_shop = (res[:shopping_results] || []).first
     return first_shop[:link] if first_shop
-    
-    return nil
+
+    nil
   end
 
   def fetch_advanced_page_data(url)
-    return "" if url.nil? || url.empty?
+    return "" if url.nil? || url.to_s.strip.empty?
+
     begin
       user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      response = HTTParty.get(url, headers: {"User-Agent" => user_agent}, timeout: 8)
-      
-      html = response.body
+      response = HTTParty.get(url, headers: { "User-Agent" => user_agent }, timeout: 10)
+
+      html = response.body.to_s
       doc = Nokogiri::HTML(html)
-      
+
       doc.css('script, style, nav, footer, iframe').remove
       visual_text = doc.text.gsub(/\s+/, " ").strip[0..4000]
 
       json_ld_data = ""
       doc.css('script[type="application/ld+json"]').each do |script|
-        json_ld_data += " " + script.content.gsub(/\s+/, " ").strip[0..2000]
+        json_ld_data += " " + script.content.to_s.gsub(/\s+/, " ").strip[0..2000]
       end
 
-      return "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD: #{json_ld_data}"
+      "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD: #{json_ld_data}"
     rescue
-      return ""
+      ""
     end
   end
 
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
-    
-    # --- STRICT MODEL LIST (FROM YOUR LOGS) ---
+
+    # IMPORTANT:
+    # Replace these with the EXACT model names returned by /debug/models
     models_to_try = [
-      "gemini-2.0-flash",       # Unlimited
-      "gemini-2.0-flash-lite",  # Unlimited
-      "gemini-2.5-flash-lite",  # Unlimited
-      "gemini-2.5-flash",       # Limited (20/day)
-      "gemini-3-flash"          # Limited (20/day)
+      "gemini-1.5-flash",
+      "gemini-1.5-pro"
     ]
-    
-    current_model_index = 0
-    
+
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
-      
+
       INPUT:
       1. WEBSITE DATA (Text + Hidden JSON):
       """
       #{page_content}
       """
       #{base64_image ? "2. IMAGE (Attached)" : "2. IMAGE: None"}
-      
+
       TASK: Extract specifications. If image is missing, rely on WEBSITE DATA.
-      
+
       LOCALIZATION: Translate ALL output (Ingredients, Name, Allergens) into #{target_lang}.
-      
+
       OUTPUT JSON:
       {
         "product_name": "Brand + Name",
@@ -200,48 +218,49 @@ class MasterDataHunter
       parts << { inline_data: { mime_type: "image/jpeg", data: base64_image } }
     end
 
-    retries = 0
-    max_retries = 2
-    
-    loop do
-      model_id = models_to_try[current_model_index]
+    models_to_try.each do |model_id|
       url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
-      
+
       begin
-        response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers)
-        
-        # 1. SUCCESS
+        response = HTTParty.post(
+          url,
+          body: { contents: [{ parts: parts }] }.to_json,
+          headers: @headers,
+          timeout: 30
+        )
+
         if response.code == 200
-          raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
-          clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
+          raw_text = response.dig("candidates", 0, "content", "parts", 0, "text")
+          if raw_text.nil? || raw_text.strip.empty?
+            puts "⚠️ Gemini returned 200 but empty text for model=#{model_id}"
+            next
+          end
+
+          clean_json = raw_text.gsub(/```json/i, "").gsub(/```/, "").strip
           return JSON.parse(clean_json)
         end
 
-        # 2. FAILURES -> SWITCH MODEL
-        if [403, 404, 429].include?(response.code)
-          puts "⚠️ Model #{model_id} failed (#{response.code}). Switching..."
-          current_model_index += 1
-          if current_model_index >= models_to_try.length
-             return { error: "All models failed. Last error: #{response.code}" }
-          end
-          retries = 0
-          next 
-        end
+        # Log real failure body (this is what you need to debug 404s)
+        puts "❌ Gemini failed model=#{model_id} code=#{response.code}"
+        puts "❌ Body: #{response.body.to_s[0..1200]}"
 
-        # 3. BAD REQUEST (400) -> Likely Image
         if response.code == 400
-          return { error: "API 400 (Bad Image)" }
+          return { error: "API 400 (Bad request; often image or payload). Body: #{response.body.to_s[0..400]}" }
         end
 
-        return { error: "API #{response.code}: #{response.message}" }
-        
+        # try next model for these
+        next if [403, 404, 429].include?(response.code)
+
+        return { error: "API #{response.code}: #{response.body.to_s[0..400]}" }
       rescue => e
-        return { error: "JSON Parse Error" }
+        return { error: "#{e.class}: #{e.message}" }
       end
     end
+
+    { error: "All models failed. Last error: 403/404/429 across ladder" }
   end
 
-  def empty_result(gtin, market, status_msg, img_url=nil, src_url=nil)
+  def empty_result(gtin, market, status_msg, img_url = nil, src_url = nil)
     {
       found: false, status: status_msg, gtin: gtin, market: market,
       image_url: img_url, source_url: src_url,
@@ -257,6 +276,26 @@ end
 
 get '/' do
   erb :index
+end
+
+# TEMP DEBUG: remove after you confirm models
+get '/debug/models' do
+  content_type :json
+
+  if GEMINI_API_KEY.nil? || GEMINI_API_KEY.strip.empty?
+    halt 500, { error: "Missing GEMINI_API_KEY in Render env vars" }.to_json
+  end
+
+  url = "https://generativelanguage.googleapis.com/v1beta/models?key=#{GEMINI_API_KEY}"
+  resp = HTTParty.get(url, headers: { "Content-Type" => "application/json" })
+
+  begin
+    parsed = JSON.parse(resp.body)
+  rescue
+    parsed = { raw: resp.body }
+  end
+
+  { status: resp.code, response: parsed }.to_json
 end
 
 get '/api/search' do
@@ -277,18 +316,18 @@ __END__
     body { font-family: -apple-system, system-ui, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
     h1 { color: #00816A; }
-    
+
     .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #eefcf9; padding: 15px; border-radius: 8px; }
     textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-family: monospace; }
     button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: 600; cursor: pointer; }
     button:disabled { background: #ccc; }
-    
+
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #eee; border-radius: 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2600px; }
     th { text-align: left; background: #00816A; color: white; padding: 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 250px; word-wrap: break-word; }
     tr:nth-child(even) { background: #f8f9fa; }
-    
+
     .status-found { background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .status-missing { background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
@@ -360,14 +399,14 @@ __END__
     const text = document.getElementById('inputList').value;
     const market = document.getElementById('marketSelect').value;
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    
+
     if (lines.length === 0) { alert("Paste EANs first!"); return; }
 
     document.getElementById('startBtn').disabled = true;
     const tbody = document.querySelector('#resultsTable tbody');
     tbody.innerHTML = "";
     resultsData = [];
-    
+
     let processed = 0;
 
     for (const gtin of lines) {
@@ -380,10 +419,10 @@ __END__
       try {
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
-        
+
         let displayStatus = data.status;
         let statusClass = 'status-found';
-        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("429") || data.status.includes("403")) {
+        if (String(data.status).includes("Error") || String(data.status).includes("Missing") || String(data.status).includes("429") || String(data.status).includes("403") || String(data.status).includes("404")) {
            statusClass = 'status-missing';
         }
 
@@ -415,12 +454,11 @@ __END__
           <td>${infoLink}</td>
         `;
         resultsData.push(data);
-      } catch (e) { 
+      } catch (e) {
         tr.innerHTML = `<td style="color:red">Error</td>` + emptyCells;
       }
       processed++;
-      
-      // Strict 10s delay to be safe
+
       if (processed < lines.length) {
         document.getElementById('statusText').innerText = `Cooling down (10s)...`;
         await new Promise(r => setTimeout(r, 10000));
@@ -433,7 +471,7 @@ __END__
 
   function downloadCSV() {
     let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID,FoodInfoSource\n";
-    
+
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
       csv += `${row.gtin},${clean(row.product_name)},${row.status},${row.image_url},${row.source_url},` +
@@ -442,7 +480,7 @@ __END__
              `${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},` +
              `${clean(row.salt)},${clean(row.organic_id)},${row.source_url}\n`;
     });
-    
+
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
     link.download = "tgtg_ai_results.csv";
