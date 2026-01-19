@@ -60,7 +60,7 @@ class MasterDataHunter
     # C. FETCH CONTENT (Deep Scrape with SEO Data)
     website_content = fetch_advanced_page_data(text_source_url)
 
-    # D. COMBINE & ANALYZE (With Expanded Ladder)
+    # D. COMBINE & ANALYZE (With Fixed Model Ladder)
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
     
     # E. FALLBACK: IF IMAGE FAILED (400), RETRY TEXT ONLY
@@ -160,15 +160,13 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- EXPANDED LADDER STRATEGY ---
-    # We try Unlimited models first. If blocked (403), we use Limited models (2.5/3.0).
+    # --- UPDATED LADDER STRATEGY ---
+    # These IDs are based on your logs and standard aliases to avoid 404s.
     models_to_try = [
-      "gemini-2.0-flash",       # 1. Unlimited (Smartest)
-      "gemini-2.5-flash-lite",  # 2. Unlimited (Newest)
-      "gemini-2.0-flash-lite",  # 3. Unlimited (Fastest)
-      "gemini-2.5-flash",       # 4. Limited (20/day)
-      "gemini-3-flash",         # 5. Limited (20/day)
-      "gemini-1.5-flash"        # 6. Safety Net
+      "gemini-2.0-flash",                   # 1. Unlimited (Smartest)
+      "gemini-2.0-flash-lite-preview-02-05",# 2. Specific log version (Often unlocked)
+      "gemini-flash-latest",                # 3. THE FIX: Alias for 1.5 Flash (Standard)
+      "gemini-pro"                          # 4. Old Faithful (1.0)
     ]
     
     current_model_index = 0
@@ -215,7 +213,7 @@ class MasterDataHunter
     end
 
     retries = 0
-    max_retries = 3
+    max_retries = 2
     
     loop do
       model_id = models_to_try[current_model_index]
@@ -224,23 +222,23 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers)
         
-        # 1. SUCCESS (200)
+        # 1. SUCCESS
         if response.code == 200
           raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
           clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
           return JSON.parse(clean_json)
         end
 
-        # 2. FAILURES (403/404/429) -> TRY NEXT MODEL
-        # We treat almost ANY error as a reason to switch models immediately
+        # 2. FAILURES -> SWITCH MODEL
+        # 403 (Forbidden), 404 (Not Found), 429 (Busy) -> All trigger switch
         if [403, 404, 429].include?(response.code)
           puts "⚠️ Model #{model_id} failed (#{response.code}). Switching..."
           current_model_index += 1
           if current_model_index >= models_to_try.length
-             return { error: "All #{models_to_try.length} models failed. (Last: #{response.code})" }
+             return { error: "All models failed. (Last: #{response.code})" }
           end
           retries = 0
-          next # Try next model
+          next 
         end
 
         # 3. BAD REQUEST (400) -> Likely Image
@@ -326,6 +324,8 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
+      <option value="SE">Sweden (SE)</option>
+      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
     </select>
@@ -435,10 +435,10 @@ __END__
       }
       processed++;
       
-      // Strict 5s delay (Enough for limited testing)
+      // Strict 10s delay to let the ladder reset between items
       if (processed < lines.length) {
-        document.getElementById('statusText').innerText = `Cooling down (5s)...`;
-        await new Promise(r => setTimeout(r, 5000));
+        document.getElementById('statusText').innerText = `Cooling down (10s)...`;
+        await new Promise(r => setTimeout(r, 10000));
       }
     }
     document.getElementById('startBtn').disabled = false;
