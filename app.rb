@@ -29,7 +29,6 @@ class MasterDataHunter
     }
 
     # 2. THE GOLDMINE (Trusted Retailers)
-    # This ensures we search APPROVED sites first for text data
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr OR site:franprix.fr",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com",
@@ -49,21 +48,19 @@ class MasterDataHunter
   def process_product(gtin, market)
     return { found: false, status: "Missing API Key" } unless GEMINI_API_KEY
 
-    # A. IMAGE HUNT (Visuals)
+    # A. IMAGE HUNT
     image_data = find_best_image(gtin, market)
     
-    # B. DATA HUNT (Text)
-    # If image search gave us a good source (e.g. BarcodeLookup), read it.
-    # If not, use the "Goldmine" list to find a retailer page.
+    # B. DATA HUNT
     text_source_url = image_data ? image_data[:source] : find_text_source(gtin, market)
     
-    # C. FETCH CONTENT (Deep Scrape with SEO Data)
+    # C. FETCH CONTENT
     website_content = fetch_advanced_page_data(text_source_url)
 
-    # D. COMBINE & ANALYZE (With Fixed Model Ladder)
+    # D. ANALYZE (With Strict List Ladder)
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
     
-    # E. FALLBACK: IF IMAGE FAILED (400), RETRY TEXT ONLY
+    # E. FALLBACK
     if ai_result[:error] && ai_result[:error].include?("400")
       puts "⚠️ Image rejected. Retrying TEXT ONLY..."
       ai_result = analyze_with_gemini(nil, website_content, gtin, market)
@@ -88,14 +85,11 @@ class MasterDataHunter
 
   def find_best_image(gtin, market)
     return nil unless SERPAPI_KEY
-    # BAN LIST: UGC and Open Databases
     bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
     
-    # Priority: High-Res Barcode Sites + Amazon
     query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
     res = GoogleSearch.new(q: query, tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     
-    # Fallback to Broad Search if specific sites fail
     if (res[:images_results] || []).empty?
       res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     end
@@ -117,14 +111,12 @@ class MasterDataHunter
     goldmine = @goldmine_sites[market]
     bans = "-site:openfoodfacts.org -site:wikipedia.org"
     
-    # 1. Try Goldmine (Retailers)
     if goldmine
       res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
       first_link = (res[:organic_results] || []).first
       return first_link[:link] if first_link
     end
 
-    # 2. Try Google Shopping (Fallback)
     res = GoogleSearch.new(q: "#{gtin}", tbm: "shop", gl: market.downcase, api_key: SERPAPI_KEY).get_hash
     first_shop = (res[:shopping_results] || []).first
     return first_shop[:link] if first_shop
@@ -141,11 +133,9 @@ class MasterDataHunter
       html = response.body
       doc = Nokogiri::HTML(html)
       
-      # Extract visual text
       doc.css('script, style, nav, footer, iframe').remove
       visual_text = doc.text.gsub(/\s+/, " ").strip[0..4000]
 
-      # Extract hidden JSON-LD (SEO Data)
       json_ld_data = ""
       doc.css('script[type="application/ld+json"]').each do |script|
         json_ld_data += " " + script.content.gsub(/\s+/, " ").strip[0..2000]
@@ -160,13 +150,13 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- UPDATED LADDER STRATEGY ---
-    # These IDs are based on your logs and standard aliases to avoid 404s.
+    # --- STRICT MODEL LIST (FROM YOUR LOGS) ---
     models_to_try = [
-      "gemini-2.0-flash",                   # 1. Unlimited (Smartest)
-      "gemini-2.0-flash-lite-preview-02-05",# 2. Specific log version (Often unlocked)
-      "gemini-flash-latest",                # 3. THE FIX: Alias for 1.5 Flash (Standard)
-      "gemini-pro"                          # 4. Old Faithful (1.0)
+      "gemini-2.0-flash",       # Unlimited
+      "gemini-2.0-flash-lite",  # Unlimited
+      "gemini-2.5-flash-lite",  # Unlimited
+      "gemini-2.5-flash",       # Limited (20/day)
+      "gemini-3-flash"          # Limited (20/day)
     ]
     
     current_model_index = 0
@@ -174,36 +164,34 @@ class MasterDataHunter
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
       
-      INPUT DATA:
-      1. WEBSITE CONTENT (Retailer Text + SEO Data):
+      INPUT:
+      1. WEBSITE DATA (Text + Hidden JSON):
       """
       #{page_content}
       """
-      #{base64_image ? "2. PRODUCT IMAGE (Attached)" : "2. IMAGE: None (Text analysis only)"}
+      #{base64_image ? "2. IMAGE (Attached)" : "2. IMAGE: None"}
       
-      CORE TASK: 
-      Extract specifications. Prioritize the Website Content if the Image is missing or unclear.
+      TASK: Extract specifications. If image is missing, rely on WEBSITE DATA.
       
-      LOCALIZATION RULE:
-      Translate 'Product Name', 'Ingredients', 'Allergens', 'May Contain' into #{target_lang}.
+      LOCALIZATION: Translate ALL output (Ingredients, Name, Allergens) into #{target_lang}.
       
-      OUTPUT FORMAT (Strict JSON):
+      OUTPUT JSON:
       {
-        "product_name": "Brand + Product Name",
+        "product_name": "Brand + Name",
         "weight": "Net Weight",
-        "ingredients": "Full ingredients list (translated)",
-        "allergens": "List of allergens (translated)",
-        "may_contain": "May contain warnings (translated)",
-        "nutri_scope": "Header (e.g. per 100g)",
-        "energy": "Energy (kJ / kcal)",
-        "fat": "Fat value",
-        "saturates": "Saturated Fat",
-        "carbs": "Carbohydrates",
-        "sugars": "Sugars",
-        "protein": "Protein",
-        "fiber": "Fiber",
-        "salt": "Salt",
-        "organic_id": "Organic Code"
+        "ingredients": "Full List",
+        "allergens": "List",
+        "may_contain": "List",
+        "nutri_scope": "Per 100g",
+        "energy": "kJ / kcal",
+        "fat": "Value",
+        "saturates": "Value",
+        "carbs": "Value",
+        "sugars": "Value",
+        "protein": "Value",
+        "fiber": "Value",
+        "salt": "Value",
+        "organic_id": "Code"
       }
     TEXT
 
@@ -230,12 +218,11 @@ class MasterDataHunter
         end
 
         # 2. FAILURES -> SWITCH MODEL
-        # 403 (Forbidden), 404 (Not Found), 429 (Busy) -> All trigger switch
         if [403, 404, 429].include?(response.code)
           puts "⚠️ Model #{model_id} failed (#{response.code}). Switching..."
           current_model_index += 1
           if current_model_index >= models_to_try.length
-             return { error: "All models failed. (Last: #{response.code})" }
+             return { error: "All models failed. Last error: #{response.code}" }
           end
           retries = 0
           next 
@@ -324,8 +311,6 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
-      <option value="SE">Sweden (SE)</option>
-      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
     </select>
@@ -435,7 +420,7 @@ __END__
       }
       processed++;
       
-      // Strict 10s delay to let the ladder reset between items
+      // Strict 10s delay to be safe
       if (processed < lines.length) {
         document.getElementById('statusText').innerText = `Cooling down (10s)...`;
         await new Promise(r => setTimeout(r, 10000));
