@@ -29,7 +29,7 @@ class MasterDataHunter
     }
 
     # 2. THE GOLDMINE (Trusted Retailers)
-    # This ensures we search APPROVED sites first
+    # This ensures we search APPROVED sites first for text data
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr OR site:franprix.fr",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com",
@@ -57,12 +57,10 @@ class MasterDataHunter
     # If not, use the "Goldmine" list to find a retailer page.
     text_source_url = image_data ? image_data[:source] : find_text_source(gtin, market)
     
-    # C. FETCH CONTENT
-    # We scrape the text from the source we found
+    # C. FETCH CONTENT (Deep Scrape with SEO Data)
     website_content = fetch_advanced_page_data(text_source_url)
 
-    # D. COMBINE & ANALYZE
-    # Even if no image found, we send the text to Gemini
+    # D. COMBINE & ANALYZE (With The Unlimited Ladder)
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
     
     # E. FALLBACK: IF IMAGE FAILED (400), RETRY TEXT ONLY
@@ -143,15 +141,17 @@ class MasterDataHunter
       html = response.body
       doc = Nokogiri::HTML(html)
       
+      # Extract visual text
       doc.css('script, style, nav, footer, iframe').remove
       visual_text = doc.text.gsub(/\s+/, " ").strip[0..4000]
 
+      # Extract hidden JSON-LD (SEO Data)
       json_ld_data = ""
       doc.css('script[type="application/ld+json"]').each do |script|
         json_ld_data += " " + script.content.gsub(/\s+/, " ").strip[0..2000]
       end
 
-      return "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD METADATA: #{json_ld_data}"
+      return "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD: #{json_ld_data}"
     rescue
       return ""
     end
@@ -160,9 +160,16 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- UNLIMITED MODEL: GEMINI 2.0 FLASH ---
-    model_id = "gemini-2.0-flash" 
-    url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+    # --- THE UNLIMITED LADDER ---
+    # Based on your data, these 3 models are Unlimited.
+    # We try them in order of "Smartness" -> "Speed".
+    models_to_try = [
+      "gemini-2.0-flash",       # Primary: Smartest Unlimited
+      "gemini-2.5-flash-lite",  # Backup 1: Newest Unlimited
+      "gemini-2.0-flash-lite"   # Backup 2: Fastest Unlimited
+    ]
+    
+    current_model_index = 0
     
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
@@ -205,26 +212,52 @@ class MasterDataHunter
       parts << { inline_data: { mime_type: "image/jpeg", data: base64_image } }
     end
 
-    body = { contents: [{ parts: parts }] }
-
+    # --- LADDER LOGIC ---
     retries = 0
-    max_retries = 3
+    max_retries = 3 # Retries per model
     
     loop do
+      model_id = models_to_try[current_model_index]
+      url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+      
       begin
-        response = HTTParty.post(url, body: body.to_json, headers: @headers)
+        response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers)
         
-        # RATE LIMIT HANDLING (429)
+        # 1. HANDLE 403 (FORBIDDEN) or 404 (NOT FOUND)
+        # If the key is blocked from this specific model, JUMP to the next one.
+        if response.code == 403 || response.code == 404
+          puts "⚠️ Model #{model_id} failed (#{response.code}). Switching..."
+          current_model_index += 1
+          if current_model_index >= models_to_try.length
+             return { error: "All Unlimited Models Failed (403/404)." }
+          end
+          retries = 0
+          next # Try next model immediately
+        end
+
+        # 2. HANDLE 429 (RATE LIMIT - RPM)
+        # Even unlimited daily plans have "Minute" limits. We wait and retry.
         if response.code == 429
           if retries < max_retries
-            sleep_time = (retries + 1) * 5
+            sleep_time = (retries + 1) * 3
             puts "⚠️ Rate Limit (429). Sleeping #{sleep_time}s..."
             sleep(sleep_time)
             retries += 1
             next
           else
-            return { error: "API Busy (429)." }
+            # If stubborn, try next model
+            current_model_index += 1
+            if current_model_index >= models_to_try.length
+               return { error: "System Busy (429)." }
+            end
+            retries = 0
+            next
           end
+        end
+
+        # 3. HANDLE 400 (BAD REQUEST - IMAGE)
+        if response.code == 400
+          return { error: "API 400 (Bad Image)" }
         end
 
         if response.code != 200
@@ -311,6 +344,8 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
+      <option value="SE">Sweden (SE)</option>
+      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
     </select>
@@ -420,10 +455,10 @@ __END__
       }
       processed++;
       
-      // Strict 12s delay for safety
+      // Strict 5s delay (Since we have Unlimited, 5s is plenty safe for RPM)
       if (processed < lines.length) {
-        document.getElementById('statusText').innerText = `Cooling down (12s)...`;
-        await new Promise(r => setTimeout(r, 12000));
+        document.getElementById('statusText').innerText = `Cooling down (5s)...`;
+        await new Promise(r => setTimeout(r, 5000));
       }
     }
     document.getElementById('startBtn').disabled = false;
