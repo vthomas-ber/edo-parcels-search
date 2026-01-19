@@ -280,26 +280,6 @@ get '/' do
   erb :index
 end
 
-# TEMP DEBUG: remove after you confirm models
-get '/debug/models' do
-  content_type :json
-
-  if GEMINI_API_KEY.nil? || GEMINI_API_KEY.strip.empty?
-    halt 500, { error: "Missing GEMINI_API_KEY in Render env vars" }.to_json
-  end
-
-  url = "https://generativelanguage.googleapis.com/v1beta/models?key=#{GEMINI_API_KEY}"
-  resp = HTTParty.get(url, headers: { "Content-Type" => "application/json" })
-
-  begin
-    parsed = JSON.parse(resp.body)
-  rescue
-    parsed = { raw: resp.body }
-  end
-
-  { status: resp.code, response: parsed }.to_json
-end
-
 get '/api/search' do
   content_type :json
   hunter = MasterDataHunter.new
