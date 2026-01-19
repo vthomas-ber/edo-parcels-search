@@ -60,7 +60,7 @@ class MasterDataHunter
     # C. FETCH CONTENT (Deep Scrape with SEO Data)
     website_content = fetch_advanced_page_data(text_source_url)
 
-    # D. COMBINE & ANALYZE (With The Unlimited Ladder)
+    # D. COMBINE & ANALYZE (With Expanded Ladder)
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
     
     # E. FALLBACK: IF IMAGE FAILED (400), RETRY TEXT ONLY
@@ -160,13 +160,15 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # --- THE UNLIMITED LADDER ---
-    # Based on your data, these 3 models are Unlimited.
-    # We try them in order of "Smartness" -> "Speed".
+    # --- EXPANDED LADDER STRATEGY ---
+    # We try Unlimited models first. If blocked (403), we use Limited models (2.5/3.0).
     models_to_try = [
-      "gemini-2.0-flash",       # Primary: Smartest Unlimited
-      "gemini-2.5-flash-lite",  # Backup 1: Newest Unlimited
-      "gemini-2.0-flash-lite"   # Backup 2: Fastest Unlimited
+      "gemini-2.0-flash",       # 1. Unlimited (Smartest)
+      "gemini-2.5-flash-lite",  # 2. Unlimited (Newest)
+      "gemini-2.0-flash-lite",  # 3. Unlimited (Fastest)
+      "gemini-2.5-flash",       # 4. Limited (20/day)
+      "gemini-3-flash",         # 5. Limited (20/day)
+      "gemini-1.5-flash"        # 6. Safety Net
     ]
     
     current_model_index = 0
@@ -212,9 +214,8 @@ class MasterDataHunter
       parts << { inline_data: { mime_type: "image/jpeg", data: base64_image } }
     end
 
-    # --- LADDER LOGIC ---
     retries = 0
-    max_retries = 3 # Retries per model
+    max_retries = 3
     
     loop do
       model_id = models_to_try[current_model_index]
@@ -223,50 +224,31 @@ class MasterDataHunter
       begin
         response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers)
         
-        # 1. HANDLE 403 (FORBIDDEN) or 404 (NOT FOUND)
-        # If the key is blocked from this specific model, JUMP to the next one.
-        if response.code == 403 || response.code == 404
+        # 1. SUCCESS (200)
+        if response.code == 200
+          raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
+          clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
+          return JSON.parse(clean_json)
+        end
+
+        # 2. FAILURES (403/404/429) -> TRY NEXT MODEL
+        # We treat almost ANY error as a reason to switch models immediately
+        if [403, 404, 429].include?(response.code)
           puts "⚠️ Model #{model_id} failed (#{response.code}). Switching..."
           current_model_index += 1
           if current_model_index >= models_to_try.length
-             return { error: "All Unlimited Models Failed (403/404)." }
+             return { error: "All #{models_to_try.length} models failed. (Last: #{response.code})" }
           end
           retries = 0
-          next # Try next model immediately
+          next # Try next model
         end
 
-        # 2. HANDLE 429 (RATE LIMIT - RPM)
-        # Even unlimited daily plans have "Minute" limits. We wait and retry.
-        if response.code == 429
-          if retries < max_retries
-            sleep_time = (retries + 1) * 3
-            puts "⚠️ Rate Limit (429). Sleeping #{sleep_time}s..."
-            sleep(sleep_time)
-            retries += 1
-            next
-          else
-            # If stubborn, try next model
-            current_model_index += 1
-            if current_model_index >= models_to_try.length
-               return { error: "System Busy (429)." }
-            end
-            retries = 0
-            next
-          end
-        end
-
-        # 3. HANDLE 400 (BAD REQUEST - IMAGE)
+        # 3. BAD REQUEST (400) -> Likely Image
         if response.code == 400
           return { error: "API 400 (Bad Image)" }
         end
 
-        if response.code != 200
-          return { error: "API #{response.code}: #{response.message}" }
-        end
-
-        raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
-        clean_json = raw_text.gsub(/```json/, "").gsub(/```/, "").strip
-        return JSON.parse(clean_json)
+        return { error: "API #{response.code}: #{response.message}" }
         
       rescue => e
         return { error: "JSON Parse Error" }
@@ -344,8 +326,6 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
-      <option value="SE">Sweden (SE)</option>
-      <option value="NO">Norway (NO)</option>
       <option value="PL">Poland (PL)</option>
       <option value="PT">Portugal (PT)</option>
     </select>
@@ -455,7 +435,7 @@ __END__
       }
       processed++;
       
-      // Strict 5s delay (Since we have Unlimited, 5s is plenty safe for RPM)
+      // Strict 5s delay (Enough for limited testing)
       if (processed < lines.length) {
         document.getElementById('statusText').innerText = `Cooling down (5s)...`;
         await new Promise(r => setTimeout(r, 5000));
