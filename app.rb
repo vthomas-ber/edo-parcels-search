@@ -174,11 +174,12 @@ class MasterDataHunter
 
     # IMPORTANT:
     # Replace these with the EXACT model names returned by /debug/models
-    models_to_try = [
-      "gemini-1.5-flash",
-      "gemini-1.5-pro"
-    ]
-
+models_to_try = [
+  "models/gemini-2.5-flash",
+  "models/gemini-2.5-flash-lite",
+  "models/gemini-2.0-flash",
+  "models/gemini-2.0-flash-lite"
+]
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
 
@@ -219,7 +220,8 @@ class MasterDataHunter
     end
 
     models_to_try.each do |model_id|
-      url = "https://generativelanguage.googleapis.com/v1beta/models/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+      model_path = model_id.start_with?("models/") ? model_id : "models/#{model_id}"
+url = "https://generativelanguage.googleapis.com/v1beta/#{model_path}:generateContent?key=#{GEMINI_API_KEY}"
 
       begin
         response = HTTParty.post(
