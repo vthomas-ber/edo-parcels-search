@@ -172,45 +172,61 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, page_content, gtin, market)
     target_lang = @country_langs[market] || "English"
 
-    # IMPORTANT:
-    # Replace these with the EXACT model names returned by /debug/models
-models_to_try = [
-  "models/gemini-2.5-flash",
-  "models/gemini-2.5-flash-lite",
-  "models/gemini-2.0-flash",
-  "models/gemini-2.0-flash-lite"
-]
-    prompt_text = <<~TEXT
-      You are the Lead Food Product Researcher.
+    # Define models
+    models_to_try = [
+      "models/gemini-2.0-flash",
+      "models/gemini-2.0-flash-lite",
+      "models/gemini-1.5-flash"
+    ]
 
-      INPUT:
+    # --- UPDATED PROMPT FOR API USAGE (JSON) ---
+    prompt_text = <<~TEXT
+      You are the **Lead Food Product Researcher**, a specialized analyst designed to compile 100% accurate product specifications for ambient and packaged goods.
+
+      CORE DIRECTIVE: Accuracy is your absolute priority. It is better to state "N/A" than to guess.
+
+      INPUT CONTEXT:
+      - Market: #{market} (Target Language: #{target_lang})
+      - GTIN: #{gtin}
+      - DATA SOURCE: The text below (scraped from retailers) and the attached image (if any).
+
       1. WEBSITE DATA (Text + Hidden JSON):
       """
       #{page_content}
       """
-      #{base64_image ? "2. IMAGE (Attached)" : "2. IMAGE: None"}
+      #{base64_image ? "2. IMAGE: Attached" : "2. IMAGE: None"}
 
-      TASK: Extract specifications. If image is missing, rely on WEBSITE DATA.
+      ---
+      
+      ### PHASE 1: ANALYSIS & LOCALIZATION
+      1. **Analyze** the provided text and image to extract product details.
+      2. **Translate** ALL output (Ingredients, Product Name, Allergens) into **#{target_lang}**.
+      3. **Verify** details. Look for Organic Codes (e.g., DE-ÖKO-001). If none, use "N/A".
 
-      LOCALIZATION: Translate ALL output (Ingredients, Name, Allergens) into #{target_lang}.
+      ### PHASE 2: DATA STANDARDIZATION rules
+      - **Ingredients:** Must be a single continuous text string (remove bullet points/line breaks).
+      - **Energy:** Standardize to "kJ / kcal". Calculate if missing (1 kcal = 4.184 kJ).
+      - **Values:** Use "N/A" if data is missing. Do not fabricate.
 
-      OUTPUT JSON:
+      ### PHASE 3: OUTPUT FORMAT (STRICT JSON)
+      You must output valid JSON. Do not generate a Markdown table. Use exactly these keys:
+
       {
-        "product_name": "Brand + Name",
-        "weight": "Net Weight",
-        "ingredients": "Full List",
-        "allergens": "List",
-        "may_contain": "List",
-        "nutri_scope": "Per 100g",
-        "energy": "kJ / kcal",
-        "fat": "Value",
-        "saturates": "Value",
-        "carbs": "Value",
-        "sugars": "Value",
-        "protein": "Value",
-        "fiber": "Value",
-        "salt": "Value",
-        "organic_id": "Code"
+        "product_name": "Brand + Product Name (#{target_lang})",
+        "weight": "Net Weight (e.g. 500g)",
+        "ingredients": "Full List (#{target_lang})",
+        "allergens": "List (#{target_lang})",
+        "may_contain": "List (#{target_lang})",
+        "nutri_scope": "per 100g (or per serving if specified)",
+        "energy": "0000 kJ / 000 kcal",
+        "fat": "0g",
+        "saturates": "0g",
+        "carbs": "0g",
+        "sugars": "0g",
+        "protein": "0g",
+        "fiber": "0g",
+        "salt": "0g",
+        "organic_id": "Code or N/A"
       }
     TEXT
 
@@ -221,7 +237,7 @@ models_to_try = [
 
     models_to_try.each do |model_id|
       model_path = model_id.start_with?("models/") ? model_id : "models/#{model_id}"
-url = "https://generativelanguage.googleapis.com/v1beta/#{model_path}:generateContent?key=#{GEMINI_API_KEY}"
+      url = "https://generativelanguage.googleapis.com/v1beta/#{model_path}:generateContent?key=#{GEMINI_API_KEY}"
 
       begin
         response = HTTParty.post(
@@ -238,20 +254,18 @@ url = "https://generativelanguage.googleapis.com/v1beta/#{model_path}:generateCo
             next
           end
 
+          # Clean Markdown code blocks to ensure valid JSON
           clean_json = raw_text.gsub(/```json/i, "").gsub(/```/, "").strip
           return JSON.parse(clean_json)
         end
 
-        # Log real failure body (this is what you need to debug 404s)
         puts "❌ Gemini failed model=#{model_id} code=#{response.code}"
-        puts "❌ Body: #{response.body.to_s[0..1200]}"
-
+        
         if response.code == 400
-          return { error: "API 400 (Bad request; often image or payload). Body: #{response.body.to_s[0..400]}" }
+          return { error: "API 400 (Bad request). Body: #{response.body.to_s[0..400]}" }
         end
 
-        # try next model for these
-        next if [403, 404, 429].include?(response.code)
+        next if [403, 404, 429, 500, 502, 503].include?(response.code)
 
         return { error: "API #{response.code}: #{response.body.to_s[0..400]}" }
       rescue => e
@@ -338,7 +352,9 @@ __END__
   </div>
 
   <textarea id="inputList" placeholder="Paste EANs here..."></textarea>
-  <br><br>
+  
+
+
   <button id="startBtn" onclick="startBatch()">🚀 Start AI Analysis</button>
   <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download CSV</button>
   <p id="statusText" style="color: #666; margin-top: 10px;">Ready.</p>
@@ -413,7 +429,7 @@ __END__
         const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
         const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify Data</a>` : '-';
 
-        tr.innerHTML = `
+        tr.innerHTML = `<br>
           <td><span class="${statusClass}">${displayStatus}</span></td>
           <td>${imgHTML}</td>
           <td>${dlLink}</td>
