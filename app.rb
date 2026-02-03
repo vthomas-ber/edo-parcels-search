@@ -1,290 +1,195 @@
 require 'sinatra'
-require 'google_search_results'
-require 'down'
-require 'fastimage'
 require 'json'
-require 'base64'
 require 'httparty'
-require 'nokogiri'
 
 # --- CONFIGURATION ---
-GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
-SERPAPI_KEY        = ENV['SERPAPI_KEY']
-EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
+GEMINI_API_KEY = ENV['GEMINI_API_KEY']
 
-class MasterDataHunter
+class GeminiResearcher
   include HTTParty
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
-
-    # 1. MARKET DEFINITIONS
-    @country_langs = {
-      "DE" => "German", "AT" => "German", "CH" => "German",
-      "UK" => "English", "GB" => "English", "FR" => "French",
-      "BE" => "French", "IT" => "Italian", "ES" => "Spanish",
-      "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish",
-      "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
-    }
-
-    # 2. THE GOLDMINE (Trusted Retailers)
-    @goldmine_sites = {
-      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr OR site:franprix.fr",
-      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com",
-      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl OR site:vomar.nl",
-      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be",
-      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
-      "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:rema1000.dk OR site:netto.dk",
-      "IT" => "site:carrefour.it OR site:conad.it OR site:esselunga.it OR site:coop.it",
-      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:alcampo.es",
-      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se",
-      "NO" => "site:oda.com OR site:meny.no OR site:spar.no",
-      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl",
-      "PT" => "site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt"
-    }
   end
 
-  def process_product(gtin, market)
-    if GEMINI_API_KEY.nil? || GEMINI_API_KEY.strip.empty?
-      return { found: false, status: "Missing GEMINI_API_KEY" }
-    end
+  def research_product(gtin, market)
+    return { error: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.strip.empty?
 
-    # A. IMAGE HUNT
-    image_data = find_best_image(gtin, market)
+    # 1. PREPARE THE VERBATIM PROMPT (System Instruction)
+    system_instruction = <<~TEXT
+      You are the **Lead Food Product Researcher**, a specialized analyst designed to compile 100% accurate product specifications for ambient and packaged goods.
 
-    # B. DATA HUNT
-    text_source_url = image_data ? image_data[:source] : find_text_source(gtin, market)
+      **CORE DIRECTIVE:** Accuracy is your absolute priority. You are conducting manual market research to verify product details. It is better to state "No Data" than to guess.
 
-    # C. FETCH CONTENT
-    website_content = fetch_advanced_page_data(text_source_url)
+      ---
 
-    # D. ANALYZE
-    ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, website_content, gtin, market)
+      ### PHASE 1: RESEARCH SETUP
+      **Rule:** Check if the user has provided a target Market and EAN list in the first message.
+      * **IF YES:** Proceed immediately to Phase 2.
+      * **IF NO:** Ask **ONLY** these two questions to begin:
+          > 1. "Which market (country) should I research?"
+          > 2. "Please provide the list of EANs. (Max 10 items)."
 
-    # E. FALLBACK (if image causes 400)
-    if ai_result.is_a?(Hash) && ai_result[:error] && ai_result[:error].include?("API 400")
-      puts "⚠️ Image rejected or bad request. Retrying TEXT ONLY..."
-      ai_result = analyze_with_gemini(nil, website_content, gtin, market)
-    end
+      ---
 
-    if ai_result.is_a?(Hash) && ai_result[:error]
-      return empty_result(
-        gtin,
-        market,
-        ai_result[:error],
-        image_data ? image_data[:url] : nil,
-        text_source_url
-      )
-    end
+      ### PHASE 2: LOCALIZATION & RESEARCH STRATEGY
+      **Step 1: Set Target Language**
+      * Identify the **Native Official Language** of the requested Market (e.g., Input "Germany" -> Language: "German").
+      * **Requirement:** All text in the final report (Ingredients, Product Name, Allergens) **MUST** be in this Target Language.
 
-    {
-      found: true,
-      gtin: gtin,
-      status: "Found",
-      market: market,
-      image_url: image_data ? image_data[:url] : nil,
-      source_url: text_source_url,
-      **ai_result
+      **Step 2: Source Selection**
+      * **Strategy:** Search for public product pages explicitly associated with the provided EANs.
+      * **Focus:** Prioritize major online grocery retailers and official brand websites within the country's domain (e.g., .de, .it, .fr).
+      * **Exclusion:** Do not use open-source wikis (like `world.openfoodfacts.org`) or unverified calorie-counting forums.
+
+      **Step 3: Verification Standards (The "Twin-Check" Method)**
+      * **Verification:** Attempt to confirm details across at least **two independent public sources**.
+      * **Organic Check:** Look for specific Organic Certification codes (e.g., DE-ÖKO-001). If no certification code is visible, list "N/A".
+
+      ---
+
+      ### PHASE 3: DATA STANDARDIZATION
+      Before formatting, clean the findings:
+      * **Text Formatting:** Ensure 'Ingredients', 'Allergens', and 'May Contain' lists are single continuous text strings (remove bullet points and line breaks).
+      * **Units:** Standardize Energy to "kJ / kcal". If one value is missing, calculate it using the standard factor (1 kcal = 4.184 kJ) and mark with (*).
+
+      ---
+
+      ### PHASE 4: FINAL REPORT (Spreadsheet Format)
+      **Rule:** Present findings in a **Single Markdown Table**.
+      **Language:** The content must be in the **Target Language**.
+
+      **Columns:**
+      1.  **EAN** (Text format)
+      2.  **Brand**
+      3.  **Product Name** (Target Language)
+      4.  **Net Weight** (e.g., 500g)
+      5.  **Organic ID** (e.g., "DE-ÖKO-001" or "N/A")
+      6.  **Ingredients** (Full list, single string, Target Language)
+      7.  **Allergens** (Target Language)
+      8.  **May Contain** (Target Language)
+      9.  **Nutritional Scope** (e.g., "per 100g")
+      10. **Energy (kJ / kcal)**
+      11. **Fat (g)**
+      12. **- of which saturates (g)**
+      13. **Carbohydrates (g)**
+      14. **- of which sugars (g)**
+      15. **Fiber (g)**
+      16. **Protein (g)**
+      17. **Salt (g)**
+      18. **Confidence Level** (High/Medium/Low)
+
+      **Confidence Logic:**
+      * **High:** Data matches Official Brand Site OR 2+ retailers.
+      * **Medium:** Found on 1 reputable retailer.
+      * **Low:** Found on obscure third-party shop or partial data only.
+
+      ---
+
+      ### PHASE 5: REFERENCES
+      Immediately **below** the table, list your references:
+
+      **Reference Log:**
+      * **[EAN Code]**: [Confidence Level] | [Source Link 1] | [Source Link 2]
+
+      ---
+
+      ### SYSTEM SAFEGUARDS
+      1.  **Do not** exceed 10 EANs per batch.
+      2.  **Do not** fabricate data. If a field is empty, write "N/A".
+      3.  **Do not** use the words "scrape", "crawl", or "bot" in your output. You are a researcher.
+    TEXT
+
+    # 2. CALL GEMINI WITH SEARCH TOOLS
+    # Using Gemini 2.0 Flash which supports search grounding well
+    model_id = "models/gemini-2.0-flash"
+    url = "https://generativelanguage.googleapis.com/v1beta/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
+
+    user_message = "Market: #{market}\nEAN List: #{gtin}"
+
+    payload = {
+      contents: [{ parts: [{ text: user_message }] }],
+      systemInstruction: { parts: [{ text: system_instruction }] },
+      tools: [{ google_search: {} }] # <--- THIS ENABLES THE WEB SEARCH
     }
+
+    begin
+      response = HTTParty.post(url, body: payload.to_json, headers: @headers, timeout: 60)
+      
+      if response.code == 200
+        raw_text = response.dig("candidates", 0, "content", "parts", 0, "text")
+        
+        # 3. PARSE MARKDOWN TABLE TO JSON FOR FRONTEND
+        return parse_markdown_response(raw_text, gtin, market)
+      else
+        return { 
+          found: false, 
+          status: "API Error #{response.code}", 
+          gtin: gtin,
+          error_details: response.body
+        }
+      end
+    rescue => e
+      return { found: false, status: "Sys Error: #{e.message}", gtin: gtin }
+    end
   end
 
   private
 
-  def serp_gl_for_market(market)
-    # SerpAPI expects gb, not uk
-    return "gb" if market == "UK"
-    market.to_s.downcase
-  end
-
-  def find_best_image(gtin, market)
-    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.strip.empty?
-
-    bans = "-site:openfoodfacts.org -site:world.openfoodfacts.org -site:myfitnesspal.com -site:pinterest.* -site:ebay.*"
-    gl = serp_gl_for_market(market)
-
-    query = "site:barcodelookup.com OR site:go-upc.com OR site:amazon.* \"#{gtin}\""
-    res = GoogleSearch.new(q: query, tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-
-    if (res[:images_results] || []).empty?
-      res = GoogleSearch.new(q: "#{gtin} #{bans}", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-    end
-
-    (res[:images_results] || []).first(5).each do |img|
-      url = img[:original]
-      next if url.nil? || url.include?("placeholder")
-
-      begin
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024)
-        base64 = Base64.strict_encode64(File.read(tempfile.path))
-        return { url: url, source: img[:link], base64: base64 }
-      rescue
-        next
-      end
-    end
-
-    nil
-  end
-
-  def find_text_source(gtin, market)
-    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.strip.empty?
-
-    goldmine = @goldmine_sites[market]
-    bans = "-site:openfoodfacts.org -site:wikipedia.org"
-    gl = serp_gl_for_market(market)
-
-    if goldmine
-      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, api_key: SERPAPI_KEY).get_hash
-      first_link = (res[:organic_results] || []).first
-      return first_link[:link] if first_link
-    end
-
-    res = GoogleSearch.new(q: "#{gtin}", tbm: "shop", gl: gl, api_key: SERPAPI_KEY).get_hash
-    first_shop = (res[:shopping_results] || []).first
-    return first_shop[:link] if first_shop
-
-    nil
-  end
-
-  def fetch_advanced_page_data(url)
-    return "" if url.nil? || url.to_s.strip.empty?
-
-    begin
-      user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      response = HTTParty.get(url, headers: { "User-Agent" => user_agent }, timeout: 10)
-
-      html = response.body.to_s
-      doc = Nokogiri::HTML(html)
-
-      doc.css('script, style, nav, footer, iframe').remove
-      visual_text = doc.text.gsub(/\s+/, " ").strip[0..4000]
-
-      json_ld_data = ""
-      doc.css('script[type="application/ld+json"]').each do |script|
-        json_ld_data += " " + script.content.to_s.gsub(/\s+/, " ").strip[0..2000]
-      end
-
-      "VISUAL TEXT: #{visual_text}\n\nHIDDEN JSON-LD: #{json_ld_data}"
-    rescue
-      ""
-    end
-  end
-
-  def analyze_with_gemini(base64_image, page_content, gtin, market)
-    target_lang = @country_langs[market] || "English"
-
-    # Define models
-    models_to_try = [
-      "models/gemini-2.0-flash",
-      "models/gemini-2.0-flash-lite",
-      "models/gemini-1.5-flash"
-    ]
-
-    # --- UPDATED PROMPT FOR API USAGE (JSON) ---
-    prompt_text = <<~TEXT
-      You are the **Lead Food Product Researcher**, a specialized analyst designed to compile 100% accurate product specifications for ambient and packaged goods.
-
-      CORE DIRECTIVE: Accuracy is your absolute priority. It is better to state "N/A" than to guess.
-
-      INPUT CONTEXT:
-      - Market: #{market} (Target Language: #{target_lang})
-      - GTIN: #{gtin}
-      - DATA SOURCE: The text below (scraped from retailers) and the attached image (if any).
-
-      1. WEBSITE DATA (Text + Hidden JSON):
-      """
-      #{page_content}
-      """
-      #{base64_image ? "2. IMAGE: Attached" : "2. IMAGE: None"}
-
-      ---
-      
-      ### PHASE 1: ANALYSIS & LOCALIZATION
-      1. **Analyze** the provided text and image to extract product details.
-      2. **Translate** ALL output (Ingredients, Product Name, Allergens) into **#{target_lang}**.
-      3. **Verify** details. Look for Organic Codes (e.g., DE-ÖKO-001). If none, use "N/A".
-
-      ### PHASE 2: DATA STANDARDIZATION rules
-      - **Ingredients:** Must be a single continuous text string (remove bullet points/line breaks).
-      - **Energy:** Standardize to "kJ / kcal". Calculate if missing (1 kcal = 4.184 kJ).
-      - **Values:** Use "N/A" if data is missing. Do not fabricate.
-
-      ### PHASE 3: OUTPUT FORMAT (STRICT JSON)
-      You must output valid JSON. Do not generate a Markdown table. Use exactly these keys:
-
-      {
-        "product_name": "Brand + Product Name (#{target_lang})",
-        "weight": "Net Weight (e.g. 500g)",
-        "ingredients": "Full List (#{target_lang})",
-        "allergens": "List (#{target_lang})",
-        "may_contain": "List (#{target_lang})",
-        "nutri_scope": "per 100g (or per serving if specified)",
-        "energy": "0000 kJ / 000 kcal",
-        "fat": "0g",
-        "saturates": "0g",
-        "carbs": "0g",
-        "sugars": "0g",
-        "protein": "0g",
-        "fiber": "0g",
-        "salt": "0g",
-        "organic_id": "Code or N/A"
-      }
-    TEXT
-
-    parts = [{ text: prompt_text }]
-    if base64_image
-      parts << { inline_data: { mime_type: "image/jpeg", data: base64_image } }
-    end
-
-    models_to_try.each do |model_id|
-      model_path = model_id.start_with?("models/") ? model_id : "models/#{model_id}"
-      url = "https://generativelanguage.googleapis.com/v1beta/#{model_path}:generateContent?key=#{GEMINI_API_KEY}"
-
-      begin
-        response = HTTParty.post(
-          url,
-          body: { contents: [{ parts: parts }] }.to_json,
-          headers: @headers,
-          timeout: 30
-        )
-
-        if response.code == 200
-          raw_text = response.dig("candidates", 0, "content", "parts", 0, "text")
-          if raw_text.nil? || raw_text.strip.empty?
-            puts "⚠️ Gemini returned 200 but empty text for model=#{model_id}"
-            next
-          end
-
-          # Clean Markdown code blocks to ensure valid JSON
-          clean_json = raw_text.gsub(/```json/i, "").gsub(/```/, "").strip
-          return JSON.parse(clean_json)
-        end
-
-        puts "❌ Gemini failed model=#{model_id} code=#{response.code}"
-        
-        if response.code == 400
-          return { error: "API 400 (Bad request). Body: #{response.body.to_s[0..400]}" }
-        end
-
-        next if [403, 404, 429, 500, 502, 503].include?(response.code)
-
-        return { error: "API #{response.code}: #{response.body.to_s[0..400]}" }
-      rescue => e
-        return { error: "#{e.class}: #{e.message}" }
-      end
-    end
-
-    { error: "All models failed. Last error: 403/404/429 across ladder" }
-  end
-
-  def empty_result(gtin, market, status_msg, img_url = nil, src_url = nil)
-    {
-      found: false, status: status_msg, gtin: gtin, market: market,
-      image_url: img_url, source_url: src_url,
+  def parse_markdown_response(text, original_gtin, market)
+    # Default empty structure
+    result = {
+      found: false, status: "No Data", gtin: original_gtin, market: market,
       product_name: "-", weight: "-", ingredients: "-", allergens: "-",
       may_contain: "-", nutri_scope: "-", energy: "-", fat: "-",
       saturates: "-", carbs: "-", sugars: "-", protein: "-",
-      fiber: "-", salt: "-", organic_id: "-"
+      fiber: "-", salt: "-", organic_id: "-", source_url: "-"
     }
+
+    return result if text.nil?
+
+    # Extract the table row using Regex
+    # Looking for a line that starts with pipe |, contains the GTIN, and has multiple columns
+    lines = text.split("\n")
+    table_row = lines.find { |l| l.include?("|") && l.include?(original_gtin) }
+
+    # Extract Sources
+    sources = text.scan(/http[s]?:\/\/[^\s\]]+/).uniq.join(" ; ")
+
+    if table_row
+      # Split by pipe and trim whitespace
+      cols = table_row.split("|").map(&:strip)
+      # cols[0] is usually empty because the line starts with |
+      # Structure defined in prompt:
+      # 1:EAN, 2:Brand, 3:Name, 4:Weight, 5:Organic, 6:Ingred, 7:Allerg, 8:MayContain, 
+      # 9:Scope, 10:Energy, 11:Fat, 12:Sat, 13:Carbs, 14:Sugars, 15:Fiber, 16:Prot, 17:Salt, 18:Conf
+
+      # Adjust index based on whether split created an empty first element (common in markdown tables)
+      start_idx = cols[0].empty? ? 1 : 0
+      
+      result[:found] = true
+      result[:status] = cols[start_idx + 17] # Confidence Level
+      result[:gtin] = cols[start_idx]
+      # Brand is cols[start_idx+1], we combine with name
+      result[:product_name] = "#{cols[start_idx + 1]} #{cols[start_idx + 2]}"
+      result[:weight] = cols[start_idx + 3]
+      result[:organic_id] = cols[start_idx + 4]
+      result[:ingredients] = cols[start_idx + 5]
+      result[:allergens] = cols[start_idx + 6]
+      result[:may_contain] = cols[start_idx + 7]
+      result[:nutri_scope] = cols[start_idx + 8]
+      result[:energy] = cols[start_idx + 9]
+      result[:fat] = cols[start_idx + 10]
+      result[:saturates] = cols[start_idx + 11]
+      result[:carbs] = cols[start_idx + 12]
+      result[:sugars] = cols[start_idx + 13]
+      result[:fiber] = cols[start_idx + 14]
+      result[:protein] = cols[start_idx + 15]
+      result[:salt] = cols[start_idx + 16]
+      result[:source_url] = sources.empty? ? "Gemini Search" : sources
+    end
+
+    result
   end
 end
 
@@ -296,8 +201,8 @@ end
 
 get '/api/search' do
   content_type :json
-  hunter = MasterDataHunter.new
-  result = hunter.process_product(params[:gtin], params[:market])
+  researcher = GeminiResearcher.new
+  result = researcher.research_product(params[:gtin], params[:market])
   result.to_json
 end
 
@@ -307,11 +212,12 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Data Hunter</title>
+  <title>TGTG AI Pure Researcher</title>
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
     h1 { color: #00816A; }
+    .subtitle { color: #666; font-size: 0.9em; margin-bottom: 20px; }
 
     .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #eefcf9; padding: 15px; border-radius: 8px; }
     textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-family: monospace; }
@@ -319,23 +225,23 @@ __END__
     button:disabled { background: #ccc; }
 
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #eee; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2600px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2200px; }
     th { text-align: left; background: #00816A; color: white; padding: 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 250px; word-wrap: break-word; }
     tr:nth-child(even) { background: #f8f9fa; }
 
     .status-found { background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .status-missing { background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
-    .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
     .link-btn { color: #00816A; text-decoration: none; border: 1px solid #00816A; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; display: inline-block; margin-top: 2px;}
     .link-btn:hover { background: #00816A; color: white; }
-    .dl-link { font-weight: bold; text-decoration: underline; color: #333; cursor: pointer; }
   </style>
 </head>
 <body>
 
 <div class="container">
-  <h1>✨ TGTG AI Master Data Hunter</h1>
+  <h1>✨ TGTG AI Pure Researcher (Gemini Grounded)</h1>
+  <div class="subtitle">Powered by Gemini 2.0 with Google Search Grounding. No external scrapers.</div>
+  
   <div class="controls">
     <select id="marketSelect" style="padding: 8px; border-radius: 4px;">
       <option value="DE">Germany (DE)</option>
@@ -346,16 +252,12 @@ __END__
       <option value="IT">Italy (IT)</option>
       <option value="ES">Spain (ES)</option>
       <option value="DK">Denmark (DK)</option>
-      <option value="PL">Poland (PL)</option>
-      <option value="PT">Portugal (PT)</option>
     </select>
   </div>
 
-  <textarea id="inputList" placeholder="Paste EANs here..."></textarea>
-  
-
-
-  <button id="startBtn" onclick="startBatch()">🚀 Start AI Analysis</button>
+  <textarea id="inputList" placeholder="Paste EANs here (one per line)..."></textarea>
+  <br><br>
+  <button id="startBtn" onclick="startBatch()">🚀 Start Research</button>
   <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download CSV</button>
   <p id="statusText" style="color: #666; margin-top: 10px;">Ready.</p>
 
@@ -363,26 +265,24 @@ __END__
     <table id="resultsTable">
       <thead>
         <tr>
-          <th>Status</th>
-          <th>Image Preview</th>
-          <th>Download Image</th>
-          <th>Source / Variants</th>
+          <th>Confidence</th>
+          <th>Verification</th>
           <th>EAN</th>
           <th>Product Name</th>
+          <th>Weight</th>
+          <th>Organic ID</th>
           <th>Ingredients</th>
           <th>Allergens</th>
           <th>May Contain</th>
-          <th>Nutritional Scope</th>
+          <th>Scope</th>
           <th>Energy</th>
           <th>Fat</th>
           <th>Saturates</th>
           <th>Carbs</th>
           <th>Sugars</th>
-          <th>Protein</th>
           <th>Fiber</th>
+          <th>Protein</th>
           <th>Salt</th>
-          <th>Organic ID</th>
-          <th>Source (Food Info)</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -408,34 +308,30 @@ __END__
     let processed = 0;
 
     for (const gtin of lines) {
-      document.getElementById('statusText').innerText = `Analyzing ${gtin} (${processed + 1}/${lines.length})...`;
+      document.getElementById('statusText').innerText = `Researching ${gtin} (${processed + 1}/${lines.length})...`;
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<17; i++) { emptyCells += "<td></td>"; }
-      tr.innerHTML = `<td style="color:#00816A; font-weight:bold;">Thinking...</td>` + emptyCells;
+      // Create placeholders
+      tr.innerHTML = `<td style="color:#00816A; font-weight:bold;">Searching...</td>` + "<td></td>".repeat(17);
       tbody.appendChild(tr);
 
       try {
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
 
-        let displayStatus = data.status;
-        let statusClass = 'status-found';
-        if (String(data.status).includes("Error") || String(data.status).includes("Missing") || String(data.status).includes("429") || String(data.status).includes("403") || String(data.status).includes("404")) {
-           statusClass = 'status-missing';
-        }
+        let displayStatus = data.status || "Low";
+        let statusClass = (displayStatus.includes("High") || displayStatus.includes("Medium")) ? 'status-found' : 'status-missing';
+        
+        const sourceLink = data.source_url && data.source_url.startsWith('http') 
+          ? `<a href="${data.source_url.split(';')[0]}" target="_blank" class="link-btn">🔗 Sources</a>` 
+          : '-';
 
-        const imgHTML = data.image_url ? `<img src="${data.image_url}" class="img-preview">` : '❌';
-        const dlLink = data.image_url ? `<a href="${data.image_url}" target="_blank" class="link-btn">⬇️ View Full</a>` : '-';
-        const sourceLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">🔗 Variants</a>` : '-';
-        const infoLink = data.source_url ? `<a href="${data.source_url}" target="_blank" class="link-btn">✅ Verify Data</a>` : '-';
-
-        tr.innerHTML = `<br>
+        tr.innerHTML = `
           <td><span class="${statusClass}">${displayStatus}</span></td>
-          <td>${imgHTML}</td>
-          <td>${dlLink}</td>
           <td>${sourceLink}</td>
           <td>${gtin}</td>
           <td>${data.product_name}</td>
+          <td>${data.weight}</td>
+          <td>${data.organic_id}</td>
           <td>${data.ingredients}</td>
           <td>${data.allergens}</td>
           <td>${data.may_contain}</td>
@@ -445,43 +341,38 @@ __END__
           <td>${data.saturates}</td>
           <td>${data.carbs}</td>
           <td>${data.sugars}</td>
-          <td>${data.protein}</td>
           <td>${data.fiber}</td>
+          <td>${data.protein}</td>
           <td>${data.salt}</td>
-          <td>${data.organic_id}</td>
-          <td>${infoLink}</td>
         `;
         resultsData.push(data);
       } catch (e) {
-        tr.innerHTML = `<td style="color:red">Error</td>` + emptyCells;
+        tr.innerHTML = `<td style="color:red">Error</td>` + "<td></td>".repeat(17);
+        console.error(e);
       }
       processed++;
-
-      if (processed < lines.length) {
-        document.getElementById('statusText').innerText = `Cooling down (10s)...`;
-        await new Promise(r => setTimeout(r, 10000));
-      }
     }
+    
     document.getElementById('startBtn').disabled = false;
     document.getElementById('downloadBtn').style.display = "inline-block";
-    document.getElementById('statusText').innerText = "Batch Complete!";
+    document.getElementById('statusText').innerText = "Research Complete!";
   }
 
   function downloadCSV() {
-    let csv = "EAN,ProductName,Status,ImageURL,SourceVariants,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Protein,Fiber,Salt,OrganicID,FoodInfoSource\n";
+    let csv = "EAN,ProductName,Weight,OrganicID,Ingredients,Allergens,MayContain,NutritionalScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt,Confidence,Sources\n";
 
     resultsData.forEach(row => {
-      const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
-      csv += `${row.gtin},${clean(row.product_name)},${row.status},${row.image_url},${row.source_url},` +
-             `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
-             `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},${clean(row.saturates)},` +
-             `${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},${clean(row.fiber)},` +
-             `${clean(row.salt)},${clean(row.organic_id)},${row.source_url}\n`;
+      const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/"/g, '""').replace(/\n/g, " ").trim();
+      csv += `${row.gtin},"${clean(row.product_name)}","${clean(row.weight)}","${clean(row.organic_id)}",` +
+             `"${clean(row.ingredients)}","${clean(row.allergens)}","${clean(row.may_contain)}",` +
+             `"${clean(row.nutri_scope)}","${clean(row.energy)}","${clean(row.fat)}","${clean(row.saturates)}",` +
+             `"${clean(row.carbs)}","${clean(row.sugars)}","${clean(row.fiber)}","${clean(row.protein)}",` +
+             `"${clean(row.salt)}","${clean(row.status)}","${clean(row.source_url)}"\n`;
     });
 
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
-    link.download = "tgtg_ai_results.csv";
+    link.download = "gemini_research_results.csv";
     link.click();
   }
 </script>
