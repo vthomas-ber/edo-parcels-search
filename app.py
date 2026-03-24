@@ -177,12 +177,140 @@ def extract_data_with_ai(product_name, scraped_text, market_code, gemini_key):
         )
         
         raw_json = response.text.strip()
-        # Pulisce i blocchi markdown se generati da Gemini
-        if raw_json.startswith("
-http://googleusercontent.com/immersive_entry_chip/0
-http://googleusercontent.com/immersive_entry_chip/1
-http://googleusercontent.com/immersive_entry_chip/2
+        # Pulisce i blocchi markdown se generati da Gemini in modo sicuro
+        if raw_json.startswith("```json"): 
+            raw_json = raw_json[7:]
+        elif raw_json.startswith("```"): 
+            raw_json = raw_json[3:]
+            
+        if raw_json.endswith("```"): 
+            raw_json = raw_json[:-3]
+        
+        data = json.loads(raw_json.strip())
+        return data
+        
+    except Exception as e:
+        return {"error": "Elaborazione AI Fallita o JSON non valido", "diagnostic_log": str(e)}
 
-Ricordati, su Render:
-1. Elimina il Web Service attuale e creane uno nuovo per forzarlo ad abbandonare Ruby.
-2. Imposta `PYTHON_VERSION` a `3.10.0` nelle Environment Variables!
+# --- UI APP (STREAMLIT) ---
+st.title("🍔 Food Data Hunter (Diagnostic Edition)")
+st.markdown("Questo strumento cerca sul web, scarica il testo delle pagine e usa l'AI per leggerlo. **Non usa l'elaborazione delle immagini per estrarre i dati.**")
+
+# Sidebar per le impostazioni
+with st.sidebar:
+    st.header("🔑 Configurazione API")
+    SERP_KEY = st.text_input("SerpAPI Key", value=os.environ.get("SERPAPI_KEY", ""), type="password")
+    GEMINI_KEY = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
+    
+    st.header("🌍 Mercato")
+    market = st.selectbox("Mercato Target", ["IT", "DE", "UK", "FR", "ES"])
+
+# Area Principale
+ean_input = st.text_area("Incolla gli EAN (uno per riga):", "4018077669132\n4260725010074")
+
+if st.button("🚀 Avvia Ricerca Profonda", type="primary"):
+    if not SERP_KEY or not GEMINI_KEY:
+        st.error("Per favore, inserisci le API Key nella barra laterale.")
+        st.stop()
+        
+    eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
+    if not eans:
+        st.warning("Inserisci almeno un EAN.")
+        st.stop()
+        
+    # Prepara indicatori UI
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+    
+    # Liste per salvare i risultati
+    results = []
+    diagnostics = {}
+    
+    for i, ean in enumerate(eans):
+        status_text.text(f"Elaborazione EAN {ean} ({i+1}/{len(eans)})...")
+        
+        # 1. Identità e Immagine
+        identity = find_identity_and_image(ean, market, SERP_KEY)
+        product_name = identity.get("name")
+        
+        if not product_name:
+            results.append({"EAN": ean, "Status": "Non Trovato", "Name": "Sconosciuto"})
+            diagnostics[ean] = {"Log": identity.get("identity_log")}
+            progress_bar.progress(min((i + 1) / len(eans), 1.0))
+            continue
+            
+        # 2. Scraping Web
+        web_data = harvest_web_text(product_name, market, SERP_KEY)
+        
+        # 3. Estrazione dati con AI
+        ai_data = extract_data_with_ai(product_name, web_data["text"], market, GEMINI_KEY)
+        
+        # Combina i risultati per la tabella
+        row = {
+            "EAN": ean,
+            "Status": "Errore" if "error" in ai_data else "Successo",
+            "Immagine": identity.get("image_url") or "",
+            "Brand": ai_data.get("brand", ""),
+            "Nome": ai_data.get("product_name", product_name),
+            "Peso": ai_data.get("net_weight", ""),
+            "Contesto Dati": ai_data.get("nutritional_context", ""),
+            "Energia": ai_data.get("energy", ""),
+            "Grassi": ai_data.get("fat", ""),
+            "Carbo": ai_data.get("carbs", ""),
+            "Zuccheri": ai_data.get("sugars", ""),
+            "Proteine": ai_data.get("protein", ""),
+            "Sale": ai_data.get("salt", "")
+        }
+        results.append(row)
+        
+        # Salva la diagnostica completa in background
+        diagnostics[ean] = {
+            "Nome Prodotto Trovato": product_name,
+            "URL Visitati": web_data["urls"],
+            "Log Scraping": web_data["log"],
+            "Lunghezza Testo": len(web_data["text"]),
+            "Testo Grezzo (Snippet)": web_data["text"][:1500] + "...\n[TRONCATO]",
+            "Pensiero di Gemini": ai_data.get("diagnostic_log", ai_data.get("error", "Nessun log disponibile."))
+        }
+        
+        progress_bar.progress(min((i + 1) / len(eans), 1.0))
+        
+    status_text.text("✅ Elaborazione Completata!")
+    
+    # Mostra Tabella Risultati
+    st.subheader("📊 Risultati Estrazione")
+    df = pd.DataFrame(results)
+    
+    # Mostra immagini HTML nel dataframe nativo di Streamlit
+    st.data_editor(
+        df,
+        column_config={
+            "Immagine": st.column_config.ImageColumn("Immagine", help="Foto Prodotto")
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    # Mostra Centro Diagnostico
+    st.divider()
+    st.subheader("🔬 Centro Diagnostico")
+    st.markdown("Controlla qui per vedere **esattamente** cosa vede lo scraper e cosa pensa l'AI. Usa questo strumento per capire se i siti bloccano il bot o se l'AI si confonde.")
+    
+    selected_ean_diag = st.selectbox("Seleziona l'EAN da ispezionare:", list(diagnostics.keys()))
+    
+    if selected_ean_diag:
+        diag = diagnostics.get(selected_ean_diag, {})
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Stato Web Harvester**\n\n{diag.get('Log Scraping', 'N/A')}")
+            st.write("**URL Analizzati con successo:**")
+            for u in diag.get("URL Visitati", []):
+                st.write(f"- {u}")
+                
+        with col2:
+            st.warning("**Processo di Pensiero AI (Gemini)**")
+            st.write(diag.get("Pensiero di Gemini", "N/A"))
+            
+        with st.expander("👀 Visualizza il Testo Grezzo inviato all'AI (Primi 1500 caratteri)"):
+            st.text(diag.get("Testo Grezzo (Snippet)", "Nessun testo disponibile."))
