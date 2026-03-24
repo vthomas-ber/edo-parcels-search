@@ -13,16 +13,29 @@ def get_basic_info(ean, serp_key, market_code):
     if not serp_key: return None, None
     gl = market_code.lower()
     
-    # Trova il nome
     try:
-        res_name = requests.get("[https://serpapi.com/search](https://serpapi.com/search)", params={"q": f'"{ean}"', "gl": gl, "api_key": serp_key}, timeout=10).json()
+        # Ricerca senza virgolette strette per massimizzare i risultati
+        params = {"q": str(ean), "gl": gl, "api_key": serp_key}
+        res_name = requests.get("https://serpapi.com/search", params=params, timeout=10).json()
+        
+        # CONTROLLO ERRORI SERPAPI (Es. Crediti Finiti)
+        if "error" in res_name:
+            return f"Errore API: {res_name['error']}", None
+            
         organic = res_name.get("organic_results", [])
+        
+        # FALLBACK: Se non trova niente in quel mercato, cerca a livello globale
+        if not organic:
+            res_name = requests.get("https://serpapi.com/search", params={"q": str(ean), "api_key": serp_key}, timeout=10).json()
+            organic = res_name.get("organic_results", [])
+            
         if not organic: return None, None
         
+        # Prendi il titolo e puliscilo
         product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
         
-        # Trova la foto
-        res_img = requests.get("[https://serpapi.com/search](https://serpapi.com/search)", params={"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10).json()
+        # Trova la foto (aggiunto controllo errori anche qui)
+        res_img = requests.get("https://serpapi.com/search", params={"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10).json()
         img_url = None
         for img in res_img.get("images_results", []):
             if "pinterest" not in img.get("original", ""):
@@ -30,8 +43,9 @@ def get_basic_info(ean, serp_key, market_code):
                 break
                 
         return product_name, img_url
-    except Exception:
-        return None, None
+        
+    except Exception as e:
+        return f"Errore API: Connessione fallita ({str(e)})", None
 
 # --- 2. IL TUO PROMPT PER GEMINI (Con Google Search Abilitato) ---
 def get_nutrition_with_gemini_search(ean, product_name, market_code, gemini_key):
@@ -129,6 +143,13 @@ if st.button("🚀 Avvia Ricerca", type="primary"):
             # 1. Trova nome e foto
             name, img = get_basic_info(ean, SERP_KEY, market)
             
+            # Controllo se SerpAPI ha restituito un errore esplicito
+            if name and str(name).startswith("Errore API"):
+                results.append({"EAN": ean, "Status": name, "Image": ""})
+                st.error(f"Attenzione su EAN {ean}: {name}")
+                continue
+            
+            # Controllo se non ha trovato nulla
             if not name:
                 results.append({"EAN": ean, "Status": "Nome non trovato", "Image": ""})
                 continue
@@ -140,7 +161,7 @@ if st.button("🚀 Avvia Ricerca", type="primary"):
             row = {
                 "EAN": ean,
                 "Image": img or "",
-                "Status": "Errore" if "error" in data else "Successo"
+                "Status": "Errore JSON" if "error" in data else "Successo"
             }
             # Aggiunge i dati estratti (se presenti)
             row.update(data)
