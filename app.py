@@ -16,7 +16,7 @@ def get_basic_info(ean, serp_key, market_code):
     try:
         # Ricerca senza virgolette strette per massimizzare i risultati
         params = {"q": str(ean), "gl": gl, "api_key": serp_key}
-        res_name = requests.get("https://serpapi.com/search", params=params, timeout=10).json()
+        res_name = requests.get("https://serpapi.com/search", params=params, timeout=20).json()
         
         # CONTROLLO ERRORI SERPAPI (Es. Crediti Finiti)
         if "error" in res_name:
@@ -26,7 +26,7 @@ def get_basic_info(ean, serp_key, market_code):
         
         # FALLBACK: Se non trova niente in quel mercato, cerca a livello globale
         if not organic:
-            res_name = requests.get("https://serpapi.com/search", params={"q": str(ean), "api_key": serp_key}, timeout=10).json()
+            res_name = requests.get("https://serpapi.com/search", params={"q": str(ean), "api_key": serp_key}, timeout=20).json()
             organic = res_name.get("organic_results", [])
             
         if not organic: return None, None
