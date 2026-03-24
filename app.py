@@ -7,23 +7,19 @@ import os
 from google import genai
 from google.genai import types
 
-# --- CONFIGURATIONS ---
+# --- CONFIGURAZIONI ---
 st.set_page_config(page_title="Food Data Hunter (Diagnostic Ed.)", layout="wide")
 
-# Try to get keys from environment, otherwise allow user to input them
-SERPAPI_KEY_ENV = os.environ.get("SERPAPI_KEY", "")
-GEMINI_API_KEY_ENV = os.environ.get("GEMINI_API_KEY", "")
-
 # --- UTILITY: GOOGLE SEARCH (SERPAPI) ---
-def google_search(query, gl="us", hl="en", search_type=None, num=3):
-    """Executes a Google Search using SerpAPI."""
-    if not st.session_state.serpapi_key: return {}
+def google_search(query, api_key, gl="us", hl="en", search_type=None, num=3):
+    """Esegue una ricerca Google usando SerpAPI."""
+    if not api_key: return {}
     
     params = {
         "q": query,
         "gl": gl,
         "hl": hl,
-        "api_key": st.session_state.serpapi_key,
+        "api_key": api_key,
         "num": num
     }
     if search_type == "image":
@@ -35,26 +31,26 @@ def google_search(query, gl="us", hl="en", search_type=None, num=3):
     except Exception as e:
         return {"error": str(e)}
 
-# --- STEP 1: FIND IDENTITY & IMAGE ---
-def find_identity_and_image(ean, market_code):
-    """Finds the product name and a reference image."""
+# --- STEP 1: TROVA IDENTITÀ E IMMAGINE ---
+def find_identity_and_image(ean, market_code, serp_key):
+    """Trova il nome del prodotto e un'immagine di riferimento."""
     result = {"name": None, "image_url": None, "identity_log": ""}
     
-    # Search name
-    search_res = google_search(f'"{ean}"', gl=market_code.lower(), num=2)
+    # Cerca il nome
+    search_res = google_search(f'"{ean}"', api_key=serp_key, gl=market_code.lower(), num=2)
     organic = search_res.get("organic_results", [])
     
     if organic:
-        # Take the title of the first result, clean it up
+        # Prende il titolo del primo risultato
         raw_title = organic[0].get("title", "")
         result["name"] = raw_title.split("-")[0].split("|")[0].strip()
-        result["identity_log"] = f"Name found via EAN search: {result['name']}"
+        result["identity_log"] = f"Nome trovato via EAN: {result['name']}"
     else:
-        result["identity_log"] = "Name NOT found. SerpAPI returned no organic results for this EAN."
+        result["identity_log"] = "Nome NON trovato. SerpAPI non ha restituito risultati organici per questo EAN."
         return result
 
-    # Search image (using the name we just found)
-    img_res = google_search(result["name"], gl=market_code.lower(), search_type="image", num=3)
+    # Cerca l'immagine (usando il nome appena trovato)
+    img_res = google_search(result["name"], api_key=serp_key, gl=market_code.lower(), search_type="image", num=3)
     images = img_res.get("images_results", [])
     for img in images:
         url = img.get("original", "")
@@ -64,12 +60,12 @@ def find_identity_and_image(ean, market_code):
             
     return result
 
-# --- STEP 2: WEB HARVESTER (THE DUMB SCRAPER) ---
-def harvest_web_text(product_name, market_code):
-    """Searches for ingredients/nutrition and scrapes the actual webpage text."""
-    if not product_name: return {"text": "", "urls": [], "log": "No product name to search."}
+# --- STEP 2: WEB HARVESTER (LO SCRAPER) ---
+def harvest_web_text(product_name, market_code, serp_key):
+    """Cerca gli ingredienti/valori e scarica il testo dalle pagine web."""
+    if not product_name: return {"text": "", "urls": [], "log": "Nessun nome prodotto da cercare."}
     
-    # Localized search terms
+    # Termini di ricerca localizzati
     terms = {
         "IT": "ingredienti valori nutrizionali",
         "DE": "zutaten nährwerte",
@@ -80,7 +76,7 @@ def harvest_web_text(product_name, market_code):
     search_term = terms.get(market_code, "ingredients nutrition")
     query = f'"{product_name}" {search_term} -site:openfoodfacts.org -site:pinterest.com'
     
-    search_res = google_search(query, gl=market_code.lower(), num=4)
+    search_res = google_search(query, api_key=serp_key, gl=market_code.lower(), num=4)
     organic = search_res.get("organic_results", [])
     
     urls_visited = []
@@ -95,90 +91,98 @@ def harvest_web_text(product_name, market_code):
         if not url or url.endswith('.pdf'): continue
         
         try:
-            # Fetch the webpage
+            # Scarica la pagina web
             page = requests.get(url, headers=headers, timeout=6)
             if page.status_code == 200:
                 urls_visited.append(url)
                 soup = BeautifulSoup(page.text, "html.parser")
                 
-                # Remove junk
+                # Rimuove spazzatura (menu, script, footer)
                 for junk in soup(["script", "style", "nav", "footer", "header", "noscript"]):
                     junk.decompose()
                 
-                # SPECIAL TRICK: Preserve table structures by replacing </td> with " | "
+                # TRUCCO SPECIALE: Preserva la struttura delle tabelle sostituendo i tag di chiusura colonna con " | "
                 for td in soup.find_all('td'):
                     td.append(" | ")
                 for th in soup.find_all('th'):
                     th.append(" | ")
                     
-                # Extract text
+                # Estrae il testo pulito
                 text = soup.get_text(separator=' ', strip=True)
-                # Keep only first 4000 chars per site to avoid overloading the AI
-                combined_text += f"\n\n--- SOURCE: {url} ---\n{text[:4000]}\n"
+                
+                # Tiene solo i primi 4000 caratteri per sito per non ingolfare l'AI
+                combined_text += f"\n\n--- FONTE: {url} ---\n{text[:4000]}\n"
         except Exception as e:
-            pass # Skip if site blocks or times out
+            pass # Salta al prossimo URL se il sito blocca la richiesta
             
-    log_msg = f"Visited {len(urls_visited)} URLs. Extracted {len(combined_text)} characters."
+    log_msg = f"Visitati {len(urls_visited)} URL. Estratti {len(combined_text)} caratteri."
     return {"text": combined_text, "urls": urls_visited, "log": log_msg}
 
-# --- STEP 3: AI EXTRACTOR (SMART PARSER - ZERO CONSTRAINTS) ---
-def extract_data_with_ai(product_name, scraped_text, market_code):
-    """Uses Gemini to read the scraped text and extract data without strict constraints."""
+# --- STEP 3: AI EXTRACTOR (ZERO CONSTRAINTS) ---
+def extract_data_with_ai(product_name, scraped_text, market_code, gemini_key):
+    """Usa Gemini per leggere il testo estratto e compilare i dati (Senza vincoli)."""
     if not scraped_text.strip():
-        return {"error": "No text extracted from websites.", "diagnostic_log": "Scraper was blocked or found nothing."}
+        return {"error": "Nessun testo estratto dai siti.", "diagnostic_log": "Lo scraper è stato bloccato o non ha trovato nulla."}
         
     prompt = f"""
-    You are an expert Food Data Extractor.
-    TARGET PRODUCT: {product_name}
-    MARKET: {market_code}
+    Sei un esperto Estrattore di Dati Alimentari.
+    PRODOTTO TARGET: {product_name}
+    MERCATO: {market_code}
     
-    Below is RAW TEXT scraped from various websites. It is messy, and nutritional tables might be flattened into single lines.
+    Di seguito c'è del TESTO GREZZO estratto da vari siti web. È disordinato e le tabelle nutrizionali potrebbero essere state appiattite in singole righe.
     
-    RAW TEXT:
+    TESTO GREZZO:
     {scraped_text}
     
-    YOUR MISSION:
-    Read the text and extract the product information.
+    LA TUA MISSIONE:
+    Leggi il testo ed estrai le informazioni del prodotto.
     
-    RULES (ZERO CONSTRAINTS):
-    1. MAXIMIZE COMPLETENESS. If you find any trace of nutritional values, extract them.
-    2. Do NOT force values to be 100g. If the text says "per serving (25g) contains 50 kcal", write "50 kcal (per serving)".
-    3. If the text is messy (e.g. "Fat Carbohydrates 10g 20g"), use your AI brain to deduce which number belongs to which nutrient based on standard nutritional profiles.
-    4. Translate Ingredients and Allergens to the primary language of the {market_code} market.
-    5. Only write "null" if there is absolutely ZERO mention of that data in the text.
+    REGOLE (ZERO VINCOLI):
+    1. MASSIMIZZA LA COMPLETEZZA. Se trovi qualsiasi traccia di valori nutrizionali, estraili.
+    2. NON forzare i valori a 100g. Se il testo dice "per porzione (25g) contiene 50 kcal", scrivi "50 kcal (per porzione)".
+    3. Se il testo è confuso (es. "Grassi Carboidrati 10g 20g"), usa il tuo cervello AI per dedurre quale numero appartiene a quale nutriente in base ai profili nutrizionali standard.
+    4. Traduci Ingredienti e Allergeni nella lingua principale del mercato {market_code}.
+    5. Scrivi "null" SOLO se non c'è assolutamente NESSUNA menzione di quel dato nel testo.
     
-    OUTPUT SCHEMA:
-    Respond ONLY with a valid JSON using this exact structure:
+    SCHEMA DI OUTPUT:
+    Rispondi SOLO con un JSON valido usando questa identica struttura:
     {{
-        "diagnostic_log": "Write a short summary of WHAT you found in the text. If you found messy nutrition data and deduced it, explain how. If nutrition data is completely missing from the raw text, state clearly: 'Nutrition data missing from source text'.",
-        "brand": "Brand Name",
-        "product_name": "Full Name",
-        "net_weight": "Weight/Volume",
-        "ingredients": "Full ingredients list",
-        "allergens": "List of allergens",
-        "nutritional_context": "Are the values per 100g, per serving, or mixed?",
-        "energy": "value",
-        "fat": "value",
-        "saturates": "value",
-        "carbs": "value",
-        "sugars": "value",
-        "fiber": "value",
-        "protein": "value",
-        "salt": "value"
+        "diagnostic_log": "Scrivi un breve riassunto di COSA hai trovato nel testo. Se hai trovato dati confusi e li hai dedotti, spiega come. Se i dati nutrizionali mancano, scrivi chiaramente 'Dati nutrizionali mancanti nel testo sorgente'.",
+        "brand": "Nome Brand",
+        "product_name": "Nome Completo",
+        "net_weight": "Peso/Volume",
+        "ingredients": "Lista completa ingredienti",
+        "allergens": "Lista allergeni",
+        "nutritional_context": "I valori sono per 100g, per porzione, o misti?",
+        "energy": "valore",
+        "fat": "valore",
+        "saturates": "valore",
+        "carbs": "valore",
+        "sugars": "valore",
+        "fiber": "valore",
+        "protein": "valore",
+        "salt": "valore"
     }}
     """
     
     try:
-        client = genai.Client(api_key=st.session_state.gemini_key)
+        client = genai.Client(api_key=gemini_key)
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1
+                temperature=0.1 # Temperatura bassa per estrazione fattuale
             )
         )
         
         raw_json = response.text.strip()
-        # Clean markdown if present
+        # Pulisce i blocchi markdown se generati da Gemini
         if raw_json.startswith("
+http://googleusercontent.com/immersive_entry_chip/0
+http://googleusercontent.com/immersive_entry_chip/1
+http://googleusercontent.com/immersive_entry_chip/2
+
+Ricordati, su Render:
+1. Elimina il Web Service attuale e creane uno nuovo per forzarlo ad abbandonare Ruby.
+2. Imposta `PYTHON_VERSION` a `3.10.0` nelle Environment Variables!
