@@ -15,14 +15,14 @@ def get_basic_info(ean, serp_key, market_code):
     
     # Trova il nome
     try:
-        res_name = requests.get("https://serpapi.com/search", params={"q": f'"{ean}"', "gl": gl, "api_key": serp_key}, timeout=10).json()
+        res_name = requests.get("[https://serpapi.com/search](https://serpapi.com/search)", params={"q": f'"{ean}"', "gl": gl, "api_key": serp_key}, timeout=10).json()
         organic = res_name.get("organic_results", [])
         if not organic: return None, None
         
         product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
         
         # Trova la foto
-        res_img = requests.get("https://serpapi.com/search", params={"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10).json()
+        res_img = requests.get("[https://serpapi.com/search](https://serpapi.com/search)", params={"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10).json()
         img_url = None
         for img in res_img.get("images_results", []):
             if "pinterest" not in img.get("original", ""):
@@ -47,7 +47,7 @@ def get_nutrition_with_gemini_search(ean, product_name, market_code, gemini_key)
     1. Search the web for "{product_name} ingredients nutrition facts".
     2. Extract the data. All text MUST be translated to the native language of {market_code}.
     3. Ensure 'Ingredients' and 'Allergens' are single continuous text strings.
-    4. Format the output STRICTLY as a JSON object with no markdown formatting.
+    4. Format the output STRICTLY as a valid JSON object. DO NOT wrap the output in markdown code blocks like ```json.
     
     OUTPUT SCHEMA:
     {{
@@ -79,7 +79,6 @@ def get_nutrition_with_gemini_search(ean, product_name, market_code, gemini_key)
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
-                response_mime_type="application/json",
                 temperature=0.2,
                 tools=[{"google_search": {}}] # <--- ABILITA LA RICERCA INTERNET NATIVA
             )
@@ -87,7 +86,7 @@ def get_nutrition_with_gemini_search(ean, product_name, market_code, gemini_key)
         
         raw_json = response.text.strip()
         
-        # Pulizia sicura dei tag markdown generati da Gemini
+        # Pulizia sicura dei tag markdown generati da Gemini nel caso non segua le istruzioni
         if raw_json.startswith("```json"): 
             raw_json = raw_json[7:]
         elif raw_json.startswith("```"): 
