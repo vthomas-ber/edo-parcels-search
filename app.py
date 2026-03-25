@@ -16,7 +16,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     diagnostic_log = []
     
     # Attempt 1: Open Food Facts API (Instant, Free, usually has images)
-    off_url = f"[https://world.openfoodfacts.org/api/v0/product/](https://world.openfoodfacts.org/api/v0/product/){ean}.json"
+    off_url = f"https://world.openfoodfacts.org/api/v0/product/{ean}.json"
     try:
         async with session.get(off_url, timeout=5) as resp:
             if resp.status == 200:
@@ -37,7 +37,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
         return None, None, "\n".join(diagnostic_log)
         
     diagnostic_log.append("🔍 Falling back to SerpAPI...")
-    serp_url = "[https://serpapi.com/search](https://serpapi.com/search)"
+    serp_url = "https://serpapi.com/search"
     params = {"q": str(ean), "gl": gl, "api_key": serp_key}
     
     try:
