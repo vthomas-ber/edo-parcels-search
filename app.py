@@ -9,16 +9,18 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Fast (Async)", layout="wide")
 
-# --- 1. FAST ASYNC INFO RETRIEVAL (Name + Image in 1 Step) ---
+# --- 1. FAST ASYNC INFO RETRIEVAL (Name + Image) ---
 async def fetch_basic_info(session, ean, serp_key, market_code):
-    """Tries Open Food Facts first (free/fast), falls back to 1 single SerpAPI call."""
+    """Tries Open Food Facts first, falls back to SerpAPI text search, then SerpAPI image search if needed."""
     gl = market_code.lower()
     diagnostic_log = []
     
     # Attempt 1: Open Food Facts API (Instant, Free, usually has images)
     off_url = f"https://world.openfoodfacts.org/api/v0/product/{ean}.json"
     try:
-        async with session.get(off_url, timeout=5) as resp:
+        # OFF requires a short timeout so we don't waste time if it's slow
+        timeout_config = aiohttp.ClientTimeout(total=5)
+        async with session.get(off_url, timeout=timeout_config) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == 1:
@@ -28,10 +30,12 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
                     if name:
                         diagnostic_log.append("✅ Found Name & Image via OpenFoodFacts (0 SerpAPI credits used).")
                         return name, img, "\n".join(diagnostic_log)
+    except asyncio.TimeoutError:
+        diagnostic_log.append("⚠️ OpenFoodFacts timed out.")
     except Exception as e:
-        diagnostic_log.append(f"⚠️ OpenFoodFacts timeout/error: {e}")
+        diagnostic_log.append(f"⚠️ OpenFoodFacts error: {type(e).__name__}")
 
-    # Attempt 2: Single SerpAPI Call (Text Search + Inline Images)
+    # Attempt 2: SerpAPI Text Search (Finds name, sometimes finds thumbnail)
     if not serp_key:
         diagnostic_log.append("❌ OpenFoodFacts failed and no SerpAPI key provided.")
         return None, None, "\n".join(diagnostic_log)
@@ -39,9 +43,10 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     diagnostic_log.append("🔍 Falling back to SerpAPI...")
     serp_url = "https://serpapi.com/search"
     params = {"q": str(ean), "gl": gl, "api_key": serp_key}
+    timeout_config = aiohttp.ClientTimeout(total=15)
     
     try:
-        async with session.get(serp_url, params=params, timeout=15) as resp:
+        async with session.get(serp_url, params=params, timeout=timeout_config) as resp:
             data = await resp.json()
             
             if "error" in data:
@@ -52,7 +57,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
             if not organic:
                 # Try global fallback if local market fails
                 params.pop("gl", None)
-                async with session.get(serp_url, params=params, timeout=15) as fallback_resp:
+                async with session.get(serp_url, params=params, timeout=timeout_config) as fallback_resp:
                     data = await fallback_resp.json()
                     organic = data.get("organic_results", [])
                     
@@ -65,7 +70,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
             name = raw_title.split("-")[0].split("|")[0].strip()
             diagnostic_log.append(f"✅ Name found via SerpAPI: {name}")
             
-            # Extract Image from the SAME call (Google usually shows inline thumbnails for EANs)
+            # Extract Image from inline results
             img = None
             inline_images = data.get("inline_images", [])
             if inline_images:
@@ -74,16 +79,29 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
             elif organic[0].get("thumbnail"):
                 img = organic[0].get("thumbnail")
                 diagnostic_log.append("✅ Image scavenged from SerpAPI organic thumbnail.")
-            else:
-                diagnostic_log.append("⚠️ No image found in the single SerpAPI call.")
                 
-            return name, img, "\n".join(diagnostic_log)
-            
     except Exception as e:
         diagnostic_log.append(f"❌ SerpAPI Connection Failed: {e}")
         return None, None, "\n".join(diagnostic_log)
 
-# --- 2. GEMINI EXTRACTION (Runs in a separate thread so it doesn't block Asyncio) ---
+    # Attempt 3: Dedicated Image Search (ONLY if Attempt 2 missed the image)
+    if not img and name:
+        diagnostic_log.append("🔍 No image in main search. Running dedicated Image Search...")
+        img_params = {"q": name, "tbm": "isch", "gl": gl, "api_key": serp_key}
+        try:
+            async with session.get(serp_url, params=img_params, timeout=timeout_config) as img_resp:
+                img_data = await img_resp.json()
+                for image_res in img_data.get("images_results", []):
+                    if "pinterest" not in image_res.get("original", "") and "placeholder" not in image_res.get("original", ""):
+                        img = image_res.get("original")
+                        diagnostic_log.append("✅ Image found via dedicated SerpAPI Image search.")
+                        break
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ Dedicated Image Search failed: {e}")
+            
+    return name, img, "\n".join(diagnostic_log)
+
+# --- 2. GEMINI EXTRACTION (WITH GROUNDING METADATA) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     """Synchronous Gemini call with Google Search Tool enabled."""
     prompt = f"""
@@ -119,7 +137,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "protein": "value",
         "salt": "value",
         "confidence_level": "High/Medium/Low",
-        "sources": "URL 1, URL 2"
+        "sources": "Will be overwritten by metadata"
     }}
     """
     
@@ -134,17 +152,46 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             )
         )
         
+        # 🌟 NEW: Extract the REAL clickable URLs from Google's Grounding Metadata!
+        real_sources = []
+        try:
+            if response.candidates and response.candidates[0].grounding_metadata:
+                chunks = response.candidates[0].grounding_metadata.grounding_chunks
+                for chunk in chunks:
+                    if chunk.web and chunk.web.uri:
+                        real_sources.append(chunk.web.uri)
+        except Exception:
+            pass # If metadata fails, we just ignore it
+        
         # Safely parse JSON avoiding markdown parser bugs
         raw_json = response.text.strip()
         raw_json = raw_json.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw_json)
+        
+        # Overwrite the AI's hallucinated sources with the real Google metadata sources
+        if real_sources:
+            # Remove duplicates and join with commas
+            unique_sources = list(set(real_sources))
+            data["sources"] = ", ".join(unique_sources)
             
-        return json.loads(raw_json)
+        return data
+        
     except Exception as e:
         return {"error": str(e), "diagnostic_log": f"Gemini API Error: {str(e)}"}
 
 async def fetch_nutrition_async(ean, product_name, market_code, gemini_key):
-    """Wraps the synchronous Gemini call in an async thread."""
-    return await asyncio.to_thread(run_gemini_sync, ean, product_name, market_code, gemini_key)
+    """Wraps the synchronous Gemini call in an async thread with a strict timeout."""
+    try:
+        # Enforce an absolute 45-second limit to prevent infinite retries (Rate Limit Hangs)
+        return await asyncio.wait_for(
+            asyncio.to_thread(run_gemini_sync, ean, product_name, market_code, gemini_key),
+            timeout=45.0
+        )
+    except asyncio.TimeoutError:
+        return {
+            "error": "Gemini Request Timed Out.",
+            "diagnostic_log": "The AI took too long to respond. This usually happens when you hit the Gemini Free Tier limit (15 Requests Per Minute)."
+        }
 
 # --- 3. ASYNC WORKER PIPELINE ---
 async def process_single_ean(sem, session, ean, serp_key, gemini_key, market):
@@ -166,7 +213,7 @@ async def process_single_ean(sem, session, ean, serp_key, gemini_key, market):
         row = {
             "EAN": ean,
             "Image": img or "",
-            "Status": "JSON Error" if "error" in data else "Success",
+            "Status": "Error" if "error" in data else "Success",
             "Name": name
         }
         # Add all Gemini extracted fields to the row
@@ -182,17 +229,18 @@ async def process_single_ean(sem, session, ean, serp_key, gemini_key, market):
 
 async def run_all_eans(eans, serp_key, gemini_key, market, progress_bar, status_text):
     """Main async loop to process all EANs concurrently."""
-    # Limit to 5 concurrent requests to avoid API rate limits (DDOSing Google/SerpApi)
-    sem = asyncio.Semaphore(5) 
+    # Reduced from 5 to 3 to prevent instantly blowing past the Gemini 15 RPM limit
+    sem = asyncio.Semaphore(3) 
     
-    async with aiohttp.ClientSession() as session:
+    # Adding a standard User-Agent prevents basic anti-bot blocks from APIs like OpenFoodFacts
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'}
+    async with aiohttp.ClientSession(headers=headers) as session:
         tasks = [process_single_ean(sem, session, ean, serp_key, gemini_key, market) for ean in eans]
         
         results = []
         diagnostics = {}
         total = len(eans)
         
-        # as_completed allows us to update the progress bar as soon as ANY item finishes
         completed = 0
         for f in asyncio.as_completed(tasks):
             res = await f
