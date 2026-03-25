@@ -152,8 +152,9 @@ st.markdown("Questa versione massimizza l'accuratezza incrociando più fonti web
 
 with st.sidebar:
     st.header("API Setup")
-    serp_key = st.text_input("SerpAPI Key", type="password")
-    gemini_key = st.text_input("Gemini API Key", type="password")
+    # Recupero delle chiavi dalle variabili d'ambiente (os.environ)
+    serp_key = st.text_input("SerpAPI Key", value=os.environ.get("SERPAPI_KEY", ""), type="password")
+    gemini_key = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
     market = st.selectbox("Mercato", ["IT", "DE", "UK", "FR", "ES"])
 
 ean_input = st.text_area("Inserisci EAN (uno per riga):")
