@@ -59,10 +59,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     MARKET: {market_code}
     
     CORE DIRECTIVES: 
-    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers (e.g., Rewe, Edeka, Tesco, Carrefour, Globus). 
-    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases at all costs. Only use them as an absolute last resort if zero official retailers have the data.
+    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
+    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases at all costs. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
-    4. MISSING DATA: Do not guess. If specific data like CN Code, Dimensions, or Gross Weight is completely missing from the web, return "null".
+    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
     OUTPUT: Respond ONLY with a valid JSON.
     SCHEMA:
@@ -98,7 +98,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "List the EXACT domain names you used (e.g., 'rewe.de, tesco.com'). Do not leave blank."
+        "sources": "You MUST list the FULL EXACT URLs (starting with https://) of the specific product pages you used. Do NOT just list the domain name. Separate multiple URLs with commas."
     }}
     """
     
@@ -117,9 +117,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
         
-        # Fallback if the AI completely fails to write a source
+        # Fallback if the AI fails to write a source
         if not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
-            data["sources"] = "Verified via Google Search Snippets"
+            data["sources"] = "Verified via Google Search Snippets (No exact URL provided)"
             
         return data
     except Exception as e:
@@ -197,34 +197,47 @@ async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text
         return results
 
 # --- UI APP (STREAMLIT) ---
-st.title("🔬 Food Data Researcher PRO (Extended Columns)")
+st.title("🔬 Food Data Researcher PRO")
+
+# Retrieve API Keys silently from the environment
+SERP_KEY = os.environ.get("SERPAPI_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 with st.sidebar:
-    st.header("API Setup")
-    serp_key = st.text_input("SerpAPI Key", value=os.environ.get("SERPAPI_KEY", ""), type="password")
-    gemini_key = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
-    market = st.selectbox("Market", ["IT", "DE", "UK", "FR", "ES"])
+    st.header("⚙️ Settings")
+    market_selection = st.selectbox(
+        "Target Market", 
+        [
+            "Belgium (BE)", "Denmark (DK)", "Germany (DE)", "Austria (AT)", 
+            "Netherlands (NL)", "France (FR)", "Italy (IT)", "Spain (ES)", 
+            "United Kingdom (UK)", "Poland (PL)", "Sweden (SE)", 
+            "Norway (NO)", "Finland (FI)"
+        ]
+    )
+    # Extract just the 2-letter country code for SerpAPI (e.g., "DE")
+    market_code = market_selection.split("(")[1].replace(")", "")
 
 ean_input = st.text_area("Insert EANs (one per line):")
 
 if st.button("🚀 Start Deep Research", type="primary"):
-    if not serp_key or not gemini_key:
-        st.error("Please insert API Keys.")
-    else:
-        eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
-        if eans:
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
+    if not SERP_KEY or not GEMINI_KEY:
+        st.error("API Keys are missing from your environment variables! Please set SERPAPI_KEY and GEMINI_API_KEY on Render.")
+        st.stop()
+        
+    eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
+    if eans:
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
+        with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
+            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, market_code, progress_bar, status_text))
             
-            with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
-                all_data = asyncio.run(run_main(eans, serp_key, gemini_key, market, progress_bar, status_text))
-                
-                df = pd.DataFrame(all_data)
-                
-                st.subheader("Results")
-                st.data_editor(
-                    df,
-                    column_config={"Image": st.column_config.ImageColumn()},
-                    use_container_width=True,
-                    hide_index=True
-                )
+            df = pd.DataFrame(all_data)
+            
+            st.subheader("Results")
+            st.data_editor(
+                df,
+                column_config={"Image": st.column_config.ImageColumn()},
+                use_container_width=True,
+                hide_index=True
+            )
