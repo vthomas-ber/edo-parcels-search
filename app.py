@@ -9,98 +9,111 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
-# --- 1. RICERCA NOME E FOTO (Qualità Massima via SerpAPI) ---
+# --- 1. BASIC INFO RETRIEVAL (Name + Image via SerpAPI) ---
 async def fetch_basic_info(session, ean, serp_key, market_code):
-    """Cerca il nome e la foto migliore possibile via SerpAPI."""
+    """Fetches the best possible name and image using SerpAPI."""
     gl = market_code.lower()
     diagnostic_log = []
     
     if not serp_key:
-        return None, None, "Errore: Manca SerpAPI Key"
+        return None, None, "Error: Missing SerpAPI Key"
         
     serp_url = "https://serpapi.com/search"
-    diagnostic_log.append(f"🔍 Ricerca EAN {ean} su Google ({market_code})...")
+    diagnostic_log.append(f"🔍 Searching EAN {ean} on Google ({market_code})...")
     
     try:
-        # Step 1: Trova il nome del prodotto
+        # Step 1: Find Product Name
         async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=20) as resp:
             data = await resp.json()
             organic = data.get("organic_results", [])
             if not organic:
-                return None, None, "❌ Prodotto non trovato su Google."
+                return None, None, "❌ Product not found on Google."
             
             product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-            diagnostic_log.append(f"✅ Nome trovato: {product_name}")
+            diagnostic_log.append(f"✅ Name found: {product_name}")
 
-        # Step 2: Ricerca Immagine Dedicata (Qualità Max)
-        diagnostic_log.append(f"🖼️ Ricerca immagine alta qualità per: {product_name}...")
+        # Step 2: Dedicated High-Quality Image Search
+        diagnostic_log.append(f"🖼️ Searching high-res image for: {product_name}...")
         img_params = {"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}
         async with session.get(serp_url, params=img_params, timeout=20) as img_resp:
             img_data = await img_resp.json()
             img_url = None
             for image_res in img_data.get("images_results", []):
                 url = image_res.get("original", "")
-                # Escludiamo siti spazzatura per le foto
                 if all(x not in url.lower() for x in ["pinterest", "placeholder", "logo"]):
                     img_url = url
                     break
             
-            diagnostic_log.append("✅ Immagine trovata." if img_url else "⚠️ Immagine non trovata.")
+            diagnostic_log.append("✅ Image found." if img_url else "⚠️ Image not found.")
             return product_name, img_url, "\n".join(diagnostic_log)
             
     except Exception as e:
-        return None, None, f"❌ Errore connessione SerpAPI: {str(e)}"
+        return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI CON CROSS-VERIFICA E METADATI ---
+# --- 2. GEMINI EXTRACTION (Expanded Schema & Strict Sourcing) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
-    """Chiama Gemini con l'ordine di incrociare le fonti e restituire i link reali."""
+    """Calls Gemini with strict source prioritization and an expanded JSON schema."""
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
     MARKET: {market_code}
     
-    CORE DIRECTIVE: Accuracy and completeness are your absolute priorities. 
-    You have access to Google Search. USE IT to search multiple sources (prioritize large retailers).
-    
-    RESEARCH RULES:
-    1. CROSS-VERIFICATION: Do not rely on a single source. Verify nutritional values across at least two independent websites if possible.
-    2. LANGUAGE: All output text (Ingredients, Allergens, Name) MUST be in the native language of {market_code}.
-    3. FORMATTING: Ingredients and Allergens must be single continuous strings.
+    CORE DIRECTIVES: 
+    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
+    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases at all costs. Only use them as an absolute last resort if zero official retailers have the data.
+    3. LANGUAGE: All output text MUST be in English for standardization.
+    4. MISSING DATA: Do not guess. If specific data like CN Code, Dimensions, or Gross Weight is completely missing from the web (always look at different sources), return "null".
     
     OUTPUT: Respond ONLY with a valid JSON.
     SCHEMA:
     {{
+        "key": "Leave empty or generate a unique ID if appropriate",
+        "item_description": "Native language product name/description",
+        "cn_code": "Customs tariff number if found, else null",
         "brand": "Brand Name",
-        "product_name": "Full Name",
-        "net_weight": "Weight/Volume",
-        "ingredients": "Full list",
-        "allergens": "List",
-        "nutritional_scope": "e.g., per 100g",
-        "energy": "kJ / kcal",
-        "fat": "value",
-        "saturates": "value",
-        "carbs": "value",
-        "sugars": "value",
-        "fiber": "value",
-        "protein": "value",
-        "salt": "value",
-        "confidence_level": "High/Medium/Low",
-        "sources": "This field will be populated with all URLs found"
+        "uom": "Unit of Measure (e.g., g, ml, kg)",
+        "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
+        "fragile_item": "Yes or No",
+        "net_weight": "Weight/Volume number only",
+        "gross_weight": "Gross weight if found, else null",
+        "organic_product": "Yes or No",
+        "dietary": "Vegetarian, Vegan, Halal, Kosher, Gluten-free, etc.",
+        "net_weight_customer_facing": "How weight is displayed on pack",
+        "ingredients": "Full list as a single string",
+        "allergens": "List as a single string",
+        "may_contain": "List as a single string",
+        "nutritional_info": "Context (e.g., per 100g or per serving)",
+        "manufacturer_address": "Full address",
+        "place_of_origin": "Country/Region of origin",
+        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
+        "energy_kj": "Value in kJ",
+        "fat_g": "Value",
+        "saturates_g": "Value",
+        "carbohydrates_g": "Value",
+        "sugars_g": "Value",
+        "protein_g": "Value",
+        "fiber_g": "Value",
+        "salt_g": "Value",
+        "packaging_length": "Value or null",
+        "packaging_width": "Value or null",
+        "packaging_height": "Value or null",
+        "format": "e.g., multipack, sharing size, single",
+        "sources": "Will be populated automatically"
     }}
     """
     
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.0, # Zero per massima precisione
+                temperature=0.0,
                 tools=[{"google_search": {}}]
             )
         )
         
-        # Estrazione URL reali dai metadati di Grounding
+        # Extract real URLs from Google Grounding Metadata
         real_urls = []
         try:
             if response.candidates and response.candidates[0].grounding_metadata:
@@ -108,69 +121,123 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
                 if metadata.grounding_chunks:
                     for chunk in metadata.grounding_chunks:
                         if chunk.web and chunk.web.uri:
-                            real_urls.append(chunk.web.uri)
+                            real_urls.append(chunk.web.title) # Using Title for cleaner spreadsheet look
         except: pass
 
-        # Pulizia JSON
+        # Clean and parse JSON
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
         
-        # Inseriamo i link reali trovati da Google Search
+        # Inject verified sources
         if real_urls:
             data["sources"] = ", ".join(list(set(real_urls)))
         else:
-            data["sources"] = "Nessuna fonte verificata trovata."
+            data["sources"] = "Internal AI Memory / No clean source URL"
             
         return data
     except Exception as e:
         return {"error": str(e)}
 
+# --- 3. ASYNC PIPELINE ---
 async def process_ean(sem, session, ean, serp_key, gemini_key, market):
-    """Processa un singolo EAN."""
+    """Processes a single EAN from start to finish."""
     async with sem:
         name, img, diag_info = await fetch_basic_info(session, ean, serp_key, market)
         if not name:
-            return {"row": {"EAN": ean, "Status": "Non trovato"}, "diag": diag_info}
+            return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
-        # Gemini in un thread separato per non bloccare l'async
         data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key)
         
-        row = {"EAN": ean, "Immagine": img or "", "Status": "Successo" if "error" not in data else "Errore AI"}
-        row.update(data)
+        if "error" in data:
+            return {"row": {"GTIN / EAN": ean, "Status": "AI Error"}, "diag": diag_info}
+
+        # Map the JSON directly to your requested columns
+        row = {
+            "Image": img or "",
+            "Status": "Success",
+            "Key": data.get("key", ""),
+            "Item Description": data.get("item_description", name),
+            "GTIN / EAN": ean,
+            "CN Code": data.get("cn_code", ""),
+            "Brand": data.get("brand", ""),
+            "UoM": data.get("uom", ""),
+            "Packaging": data.get("packaging", ""),
+            "Fragile Item": data.get("fragile_item", ""),
+            "Net Weight (g) / Volume": data.get("net_weight", ""),
+            "Gross Weight (g)": data.get("gross_weight", ""),
+            "Organic Product": data.get("organic_product", ""),
+            "Dietary": data.get("dietary", ""),
+            "Net Weight/ Volume (Customer Facing)": data.get("net_weight_customer_facing", ""),
+            "Ingredients": data.get("ingredients", ""),
+            "Allergens": data.get("allergens", ""),
+            "May Contain": data.get("may_contain", ""),
+            "Nutritional Info": data.get("nutritional_info", ""),
+            "Manufacturer Address": data.get("manufacturer_address", ""),
+            "Place of Origin": data.get("place_of_origin", ""),
+            "Organic Certification ID": data.get("organic_certification_id", ""),
+            "Energy (kJ)": data.get("energy_kj", ""),
+            "Fat (g)": data.get("fat_g", ""),
+            "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
+            "Carbohydrates (g)": data.get("carbohydrates_g", ""),
+            "Of Which Sugars (g)": data.get("sugars_g", ""),
+            "Protein (g)": data.get("protein_g", ""),
+            "Fiber (g)": data.get("fiber_g", ""),
+            "Salt (g)": data.get("salt_g", ""),
+            "Packaging Length": data.get("packaging_length", ""),
+            "Packaging Width": data.get("packaging_width", ""),
+            "Packaging Height": data.get("packaging_height", ""),
+            "Format": data.get("format", ""),
+            "Sources": data.get("sources", "")
+        }
         return {"row": row, "diag": diag_info}
 
-async def run_main(eans, serp_key, gemini_key, market):
-    sem = asyncio.Semaphore(3) # Max 3 contemporaneamente per stabilità
+async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text):
+    sem = asyncio.Semaphore(3) 
     async with aiohttp.ClientSession() as session:
         tasks = [process_ean(sem, session, ean, serp_key, gemini_key, market) for ean in eans]
-        results = await asyncio.gather(*tasks)
+        
+        results = []
+        total = len(eans)
+        completed = 0
+        
+        for f in asyncio.as_completed(tasks):
+            res = await f
+            results.append(res["row"])
+            completed += 1
+            progress_bar.progress(completed / total)
+            status_text.text(f"Processed {completed}/{total} items...")
+            
         return results
 
-# --- INTERFACCIA ---
-st.title("🔬 Food Data Researcher PRO")
-st.markdown("Questa versione massimizza l'accuratezza incrociando più fonti web e recuperando i link originali.")
+# --- UI APP (STREAMLIT) ---
+st.title("🔬 Food Data Researcher PRO (Extended Columns)")
 
 with st.sidebar:
     st.header("API Setup")
-    # Recupero delle chiavi dalle variabili d'ambiente (os.environ)
     serp_key = st.text_input("SerpAPI Key", value=os.environ.get("SERPAPI_KEY", ""), type="password")
     gemini_key = st.text_input("Gemini API Key", value=os.environ.get("GEMINI_API_KEY", ""), type="password")
-    market = st.selectbox("Mercato", ["IT", "DE", "UK", "FR", "ES"])
+    market = st.selectbox("Market", ["IT", "DE", "UK", "FR", "ES"])
 
-ean_input = st.text_area("Inserisci EAN (uno per riga):")
+ean_input = st.text_area("Insert EANs (one per line):")
 
-if st.button("🚀 Avvia Ricerca Alta Qualità", type="primary"):
+if st.button("🚀 Start Deep Research", type="primary"):
     if not serp_key or not gemini_key:
-        st.error("Inserisci le chiavi API.")
+        st.error("Please insert API Keys.")
     else:
         eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
-        with st.spinner(f"Analisi di {len(eans)} prodotti in corso..."):
-            all_data = asyncio.run(run_main(eans, serp_key, gemini_key, market))
+        if eans:
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
             
-            df_rows = [r["row"] for r in all_data]
-            st.subheader("Risultati")
-            st.data_editor(
-                pd.DataFrame(df_rows),
-                column_config={"Immagine": st.column_config.ImageColumn()},
-                use_container_width=True
-            )
+            with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
+                all_data = asyncio.run(run_main(eans, serp_key, gemini_key, market, progress_bar, status_text))
+                
+                df = pd.DataFrame(all_data)
+                
+                st.subheader("Results")
+                st.data_editor(
+                    df,
+                    column_config={"Image": st.column_config.ImageColumn()},
+                    use_container_width=True,
+                    hide_index=True
+                )
