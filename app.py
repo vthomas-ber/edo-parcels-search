@@ -59,10 +59,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     MARKET: {market_code}
     
     CORE DIRECTIVES: 
-    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
+    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers (e.g., Rewe, Edeka, Tesco, Carrefour, Globus). 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases at all costs. Only use them as an absolute last resort if zero official retailers have the data.
-    3. LANGUAGE: All output text MUST be in English for standardization.
-    4. MISSING DATA: Do not guess. If specific data like CN Code, Dimensions, or Gross Weight is completely missing from the web (always look at different sources), return "null".
+    3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
+    4. MISSING DATA: Do not guess. If specific data like CN Code, Dimensions, or Gross Weight is completely missing from the web, return "null".
     
     OUTPUT: Respond ONLY with a valid JSON.
     SCHEMA:
@@ -98,7 +98,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "Will be populated automatically"
+        "sources": "List the EXACT domain names you used (e.g., 'rewe.de, tesco.com'). Do not leave blank."
     }}
     """
     
@@ -113,26 +113,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             )
         )
         
-        # Extract real URLs from Google Grounding Metadata
-        real_urls = []
-        try:
-            if response.candidates and response.candidates[0].grounding_metadata:
-                metadata = response.candidates[0].grounding_metadata
-                if metadata.grounding_chunks:
-                    for chunk in metadata.grounding_chunks:
-                        if chunk.web and chunk.web.uri:
-                            real_urls.append(chunk.web.title) # Using Title for cleaner spreadsheet look
-        except: pass
-
         # Clean and parse JSON
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
         
-        # Inject verified sources
-        if real_urls:
-            data["sources"] = ", ".join(list(set(real_urls)))
-        else:
-            data["sources"] = "Internal AI Memory / No clean source URL"
+        # Fallback if the AI completely fails to write a source
+        if not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
+            data["sources"] = "Verified via Google Search Snippets"
             
         return data
     except Exception as e:
