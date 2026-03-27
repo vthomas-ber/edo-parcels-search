@@ -48,6 +48,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Exact Grounding Links) ---
+# --- 2. GEMINI EXTRACTION (Robust JSON & Direct AI Sources) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -62,7 +63,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     
     CRITICAL JSON RULES:
     - You must respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
-    - NEVER use unescaped double quotes inside your string values (e.g., write 'Lay's' instead of "Lay"s"). This will break the parser.
+    - NEVER use unescaped double quotes inside your string values. Use single quotes if needed.
     
     SCHEMA:
     {{
@@ -97,35 +98,20 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "Leave blank, this will be overwritten programmatically"
+        "sources": "Provide 2 or 3 EXACT, full URLs (starting with https://) from the real websites you read to find this data. Separate them with commas."
     }}
     """
     
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}]
             )
         )
-        
-        # Extract the exact tracking URLs from Google's Grounding Metadata (Vertex AI links)
-        real_urls = []
-        try:
-            if response.candidates and response.candidates[0].grounding_metadata:
-                metadata = response.candidates[0].grounding_metadata
-                if metadata.grounding_chunks:
-                    for chunk in metadata.grounding_chunks:
-                        if chunk.web and chunk.web.uri:
-                            real_urls.append(chunk.web.uri)
-        except Exception: 
-            pass
-
-        # Deduplicate and keep only the top 3 working links
-        unique_urls = list(dict.fromkeys(real_urls))[:3]
 
         # Aggressive cleanup: remove markdown blocks if Gemini hallucinates them
         raw_text = response.text.strip()
@@ -140,13 +126,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         
         try:
             data = json.loads(raw_text)
-            
-            # Inject the exact working links
-            if unique_urls:
-                data["sources"] = ", ".join(unique_urls)
-            else:
-                data["sources"] = "No exact URL provided by Google Grounding"
-                
             return data
             
         except json.JSONDecodeError as e:
@@ -154,7 +133,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             
     except Exception as e:
         return {"error": f"API Error: {str(e)}"}
-
+        
 # --- 3. ASYNC PIPELINE ---
 async def process_ean(sem, session, ean, serp_key, gemini_key, market):
     async with sem:
