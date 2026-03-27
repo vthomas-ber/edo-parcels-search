@@ -47,8 +47,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     except Exception as e:
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI EXTRACTION (JSON Mode & Clean URLs) ---
-# --- 2. GEMINI EXTRACTION (Clean URLs & Aggressive JSON parsing) ---
+# --- 2. GEMINI EXTRACTION (Robust JSON & Exact Grounding Links) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -61,7 +60,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
-    OUTPUT FORMAT: You MUST respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks. Do not add any conversational text.
+    CRITICAL JSON RULES:
+    - You must respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
+    - NEVER use unescaped double quotes inside your string values (e.g., write 'Lay's' instead of "Lay"s"). This will break the parser.
     
     SCHEMA:
     {{
@@ -96,22 +97,36 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "Provide EXACTLY 2 or 3 highly reliable URLs (starting with https://). Do not provide more than 3. Separate them with a comma."
+        "sources": "Leave blank, this will be overwritten programmatically"
     }}
     """
     
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}]
-                # Removed the illegal response_mime_type
             )
         )
         
+        # Extract the exact tracking URLs from Google's Grounding Metadata (Vertex AI links)
+        real_urls = []
+        try:
+            if response.candidates and response.candidates[0].grounding_metadata:
+                metadata = response.candidates[0].grounding_metadata
+                if metadata.grounding_chunks:
+                    for chunk in metadata.grounding_chunks:
+                        if chunk.web and chunk.web.uri:
+                            real_urls.append(chunk.web.uri)
+        except Exception: 
+            pass
+
+        # Deduplicate and keep only the top 3 working links
+        unique_urls = list(dict.fromkeys(real_urls))[:3]
+
         # Aggressive cleanup: remove markdown blocks if Gemini hallucinates them
         raw_text = response.text.strip()
         if raw_text.startswith("```json"):
@@ -125,11 +140,18 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         
         try:
             data = json.loads(raw_text)
+            
+            # Inject the exact working links
+            if unique_urls:
+                data["sources"] = ", ".join(unique_urls)
+            else:
+                data["sources"] = "No exact URL provided by Google Grounding"
+                
+            return data
+            
         except json.JSONDecodeError as e:
             return {"error": f"JSON Parsing Error. The AI formatted the data incorrectly."}
             
-        return data
-        
     except Exception as e:
         return {"error": f"API Error: {str(e)}"}
 
@@ -185,7 +207,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         return {"row": row, "diag": diag_info}
 
 async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text):
-    # Bumped from 3 to 5 for faster parallel execution!
     sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
         tasks = [process_ean(sem, session, ean, serp_key, gemini_key, market) for ean in eans]
