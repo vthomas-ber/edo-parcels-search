@@ -48,6 +48,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
 # --- 2. GEMINI EXTRACTION (JSON Mode & Clean URLs) ---
+# --- 2. GEMINI EXTRACTION (Clean URLs & Aggressive JSON parsing) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -59,6 +60,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
+    
+    OUTPUT FORMAT: You MUST respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks. Do not add any conversational text.
     
     SCHEMA:
     {{
@@ -100,20 +103,30 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
-                tools=[{"google_search": {}}],
-                response_mime_type="application/json" 
+                tools=[{"google_search": {}}]
+                # Removed the illegal response_mime_type
             )
         )
         
-        # Parse the JSON directly. No more backend Vertex tracking links!
+        # Aggressive cleanup: remove markdown blocks if Gemini hallucinates them
+        raw_text = response.text.strip()
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        elif raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        
+        raw_text = raw_text.strip()
+        
         try:
-            data = json.loads(response.text)
+            data = json.loads(raw_text)
         except json.JSONDecodeError as e:
-            return {"error": f"JSON Parsing Error: {str(e)}"}
+            return {"error": f"JSON Parsing Error. The AI formatted the data incorrectly."}
             
         return data
         
