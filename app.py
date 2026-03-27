@@ -47,7 +47,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     except Exception as e:
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI EXTRACTION (Robust JSON & VertexAI Links) ---
+# --- 2. GEMINI EXTRACTION (Robust JSON & Unlimited Links) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -62,7 +62,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     
     CRITICAL JSON RULES:
     - You must respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
-    - NEVER use double quotes (") inside your text strings. If you need to quote something, use single quotes ('). Using double quotes will break the system.
+    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead to avoid breaking the JSON format.
     
     SCHEMA:
     {{
@@ -97,7 +97,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "Leave completely blank."
+        "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. If you find 10, write 10. Separate them with commas."
     }}
     """
     
@@ -112,7 +112,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             )
         )
         
-        # Pull ONLY the guaranteed VertexAI links directly from Google's backend
+        # Pull ALL guaranteed VertexAI links directly from Google's backend
         working_urls = []
         try:
             if response.candidates and response.candidates[0].grounding_metadata:
@@ -124,8 +124,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         except Exception: 
             pass
 
-        # Keep exactly the top 3 working links
-        unique_urls = list(dict.fromkeys(working_urls))[:3]
+        # Deduplicate the URLs but keep ALL of them (Removed the [:3] limit)
+        unique_urls = list(dict.fromkeys(working_urls))
 
         # Aggressive cleanup for JSON
         raw_text = response.text.strip()
@@ -141,11 +141,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         try:
             data = json.loads(raw_text)
             
-            # Inject the working Vertex links into the JSON
+            # The Double-Safety Net: 
+            # If Google gives us the Vertex links, use them. 
+            # If Google fails, keep whatever raw URLs the AI manually typed into the JSON.
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
-            else:
-                data["sources"] = "No Grounding links provided by Google"
+            elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
+                data["sources"] = "No URLs found by AI or Google Grounding"
                 
             return data
             
