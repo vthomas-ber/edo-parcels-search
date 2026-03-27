@@ -11,7 +11,6 @@ st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
 # --- 1. BASIC INFO RETRIEVAL (Name + Image via SerpAPI) ---
 async def fetch_basic_info(session, ean, serp_key, market_code):
-    """Fetches the best possible name and image using SerpAPI."""
     gl = market_code.lower()
     diagnostic_log = []
     
@@ -22,7 +21,6 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     diagnostic_log.append(f"🔍 Searching EAN {ean} on Google ({market_code})...")
     
     try:
-        # Step 1: Find Product Name
         async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=20) as resp:
             data = await resp.json()
             organic = data.get("organic_results", [])
@@ -32,7 +30,6 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
             product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
             diagnostic_log.append(f"✅ Name found: {product_name}")
 
-        # Step 2: Dedicated High-Quality Image Search
         diagnostic_log.append(f"🖼️ Searching high-res image for: {product_name}...")
         img_params = {"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}
         async with session.get(serp_url, params=img_params, timeout=20) as img_resp:
@@ -50,9 +47,8 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     except Exception as e:
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI EXTRACTION (Expanded Schema & Strict Sourcing) ---
+# --- 2. GEMINI EXTRACTION (JSON Mode & Clean URLs) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
-    """Calls Gemini with strict source prioritization and an expanded JSON schema."""
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
@@ -60,11 +56,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     
     CORE DIRECTIVES: 
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
-    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases at all costs. Only use them as an absolute last resort.
+    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
-    OUTPUT: Respond ONLY with a valid JSON.
     SCHEMA:
     {{
         "key": "Leave empty or generate a unique ID if appropriate",
@@ -98,7 +93,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "You MUST list the FULL EXACT URLs (starting with https://) of the specific product pages you used. Do NOT just list the domain name. Separate multiple URLs with commas."
+        "sources": "Provide EXACTLY 2 or 3 highly reliable URLs (starting with https://). Do not provide more than 3. Separate them with a comma."
     }}
     """
     
@@ -109,25 +104,24 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
-                tools=[{"google_search": {}}]
+                tools=[{"google_search": {}}],
+                response_mime_type="application/json" 
             )
         )
         
-        # Clean and parse JSON
-        raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw_text)
-        
-        # Fallback if the AI fails to write a source
-        if not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
-            data["sources"] = "Verified via Google Search Snippets (No exact URL provided)"
+        # Parse the JSON directly. No more backend Vertex tracking links!
+        try:
+            data = json.loads(response.text)
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON Parsing Error: {str(e)}"}
             
         return data
+        
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"API Error: {str(e)}"}
 
 # --- 3. ASYNC PIPELINE ---
 async def process_ean(sem, session, ean, serp_key, gemini_key, market):
-    """Processes a single EAN from start to finish."""
     async with sem:
         name, img, diag_info = await fetch_basic_info(session, ean, serp_key, market)
         if not name:
@@ -136,9 +130,8 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key)
         
         if "error" in data:
-            return {"row": {"GTIN / EAN": ean, "Status": "AI Error"}, "diag": diag_info}
+            return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
 
-        # Map the JSON directly to your requested columns
         row = {
             "Image": img or "",
             "Status": "Success",
@@ -179,7 +172,8 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         return {"row": row, "diag": diag_info}
 
 async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text):
-    sem = asyncio.Semaphore(3) 
+    # Bumped from 3 to 5 for faster parallel execution!
+    sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
         tasks = [process_ean(sem, session, ean, serp_key, gemini_key, market) for ean in eans]
         
@@ -199,7 +193,6 @@ async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text
 # --- UI APP (STREAMLIT) ---
 st.title("🔬 Food Data Researcher PRO")
 
-# Retrieve API Keys silently from the environment
 SERP_KEY = os.environ.get("SERPAPI_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
@@ -214,7 +207,6 @@ with st.sidebar:
             "Norway (NO)", "Finland (FI)"
         ]
     )
-    # Extract just the 2-letter country code for SerpAPI (e.g., "DE")
     market_code = market_selection.split("(")[1].replace(")", "")
 
 ean_input = st.text_area("Insert EANs (one per line):")
