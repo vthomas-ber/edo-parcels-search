@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import aiohttp
+import re
 from google import genai
 from google.genai import types
 
@@ -47,7 +48,7 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
     except Exception as e:
         return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI EXTRACTION (Robust JSON & Unlimited Links) ---
+# --- 2. GEMINI EXTRACTION (Aggressive JSON Extractor) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -60,9 +61,11 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
-    CRITICAL JSON RULES:
-    - You must respond with ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
-    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead to avoid breaking the JSON format.
+    CRITICAL JSON RULES - BREAKING THESE CAUSES FATAL CRASHES:
+    - Return ONLY a raw JSON object. No markdown, no greetings, no explanations.
+    - NEVER use double quotes (") inside text values. Replace them with single quotes (').
+    - NEVER use literal newlines inside text fields.
+    - DO NOT add trailing commas at the end of the JSON or at the end of lists.
     
     SCHEMA:
     {{
@@ -97,7 +100,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "packaging_width": "Value or null",
         "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
-        "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. If you find 10, write 10. Separate them with commas."
+        "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. Separate them with commas."
     }}
     """
     
@@ -112,7 +115,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             )
         )
         
-        # Pull ALL guaranteed VertexAI links directly from Google's backend
         working_urls = []
         try:
             if response.candidates and response.candidates[0].grounding_metadata:
@@ -124,26 +126,19 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         except Exception: 
             pass
 
-        # Deduplicate the URLs but keep ALL of them (Removed the [:3] limit)
         unique_urls = list(dict.fromkeys(working_urls))
 
-        # Aggressive cleanup for JSON
         raw_text = response.text.strip()
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        elif raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
         
-        raw_text = raw_text.strip()
+        # AGGRESSIVE REGEX EXTRACTION: Find the outermost { and }
+        start_idx = raw_text.find('{')
+        end_idx = raw_text.rfind('}')
+        if start_idx != -1 and end_idx != -1:
+            raw_text = raw_text[start_idx:end_idx+1]
         
         try:
             data = json.loads(raw_text)
             
-            # The Double-Safety Net: 
-            # If Google gives us the Vertex links, use them. 
-            # If Google fails, keep whatever raw URLs the AI manually typed into the JSON.
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
             elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
@@ -152,7 +147,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             return data
             
         except json.JSONDecodeError as e:
-            return {"error": f"JSON Parsing Error. The AI formatted the data incorrectly."}
+            # If it still fails, print the broken text so we can see the exact typo
+            preview = raw_text[:150].replace('\n', ' ') + "..." if len(raw_text) > 150 else raw_text
+            return {"error": f"JSON Error: {str(e)} | AI wrote: {preview}"}
             
     except Exception as e:
         return {"error": f"API Error: {str(e)}"}
