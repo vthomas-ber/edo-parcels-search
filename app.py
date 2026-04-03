@@ -10,13 +10,13 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
-# --- 1. BASIC INFO RETRIEVAL (Name + Image via SerpAPI) ---
+# --- 1. BASIC INFO RETRIEVAL (Name + Multiple Images via SerpAPI) ---
 async def fetch_basic_info(session, ean, serp_key, market_code):
     gl = market_code.lower()
     diagnostic_log = []
     
     if not serp_key:
-        return None, None, "Error: Missing SerpAPI Key"
+        return None, [], "Error: Missing SerpAPI Key"
         
     serp_url = "https://serpapi.com/search"
     diagnostic_log.append(f"🔍 Searching EAN {ean} on Google ({market_code})...")
@@ -26,29 +26,32 @@ async def fetch_basic_info(session, ean, serp_key, market_code):
             data = await resp.json()
             organic = data.get("organic_results", [])
             if not organic:
-                return None, None, "❌ Product not found on Google."
+                return None, [], "❌ Product not found on Google."
             
             product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
             diagnostic_log.append(f"✅ Name found: {product_name}")
 
-        diagnostic_log.append(f"🖼️ Searching high-res image for: {product_name}...")
+        diagnostic_log.append(f"🖼️ Searching high-res images for: {product_name}...")
         img_params = {"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}
         async with session.get(serp_url, params=img_params, timeout=20) as img_resp:
             img_data = await img_resp.json()
-            img_url = None
+            
+            # 🌟 NEW: Extract up to 3 high-quality images
+            img_urls = []
             for image_res in img_data.get("images_results", []):
                 url = image_res.get("original", "")
                 if all(x not in url.lower() for x in ["pinterest", "placeholder", "logo"]):
-                    img_url = url
+                    img_urls.append(url)
+                if len(img_urls) >= 3: # Stop when we have 3 good images
                     break
             
-            diagnostic_log.append("✅ Image found." if img_url else "⚠️ Image not found.")
-            return product_name, img_url, "\n".join(diagnostic_log)
+            diagnostic_log.append(f"✅ Found {len(img_urls)} images.")
+            return product_name, img_urls, "\n".join(diagnostic_log)
             
     except Exception as e:
-        return None, None, f"❌ SerpAPI Connection Error: {str(e)}"
+        return None, [], f"❌ SerpAPI Connection Error: {str(e)}"
 
-# --- 2. GEMINI EXTRACTION (Aggressive JSON Extractor) ---
+# --- 2. GEMINI EXTRACTION (Bulletproof JSON & Unlimited Links) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -61,11 +64,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
-    CRITICAL JSON RULES - BREAKING THESE CAUSES FATAL CRASHES:
-    - Return ONLY a raw JSON object. No markdown, no greetings, no explanations.
-    - NEVER use double quotes (") inside text values. Replace them with single quotes (').
-    - NEVER use literal newlines inside text fields.
-    - DO NOT add trailing commas at the end of the JSON or at the end of lists.
+    CRITICAL JSON RULES:
+    - Return ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
+    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead to avoid breaking the JSON format.
+    - Do not use literal newlines/tabs. 
     
     SCHEMA:
     {{
@@ -107,13 +109,18 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
-                tools=[{"google_search": {}}]
+                tools=[{"google_search": {}}],
+                max_output_tokens=8192 # 🌟 Prevents "Unterminated string" by raising the cap
             )
         )
+        
+        # 🌟 Catch Safety Filters blocking the response ('NoneType' error)
+        if not response.text:
+            return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
         
         working_urls = []
         try:
@@ -130,14 +137,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
 
         raw_text = response.text.strip()
         
-        # AGGRESSIVE REGEX EXTRACTION: Find the outermost { and }
-        start_idx = raw_text.find('{')
-        end_idx = raw_text.rfind('}')
-        if start_idx != -1 and end_idx != -1:
-            raw_text = raw_text[start_idx:end_idx+1]
+        # 🌟 FOOLPROOF REGEX EXTRACTION: Forces extraction of purely the JSON bracket contents
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if not match:
+            return {"error": "JSON Error: Could not find JSON object in AI response."}
+            
+        clean_json = match.group(0)
         
         try:
-            data = json.loads(raw_text)
+            # 🌟 strict=False prevents crashes from invisible control characters like \t or \n
+            data = json.loads(clean_json, strict=False)
             
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
@@ -147,8 +156,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             return data
             
         except json.JSONDecodeError as e:
-            # If it still fails, print the broken text so we can see the exact typo
-            preview = raw_text[:150].replace('\n', ' ') + "..." if len(raw_text) > 150 else raw_text
+            preview = clean_json[:150].replace('\n', ' ') + "..." if len(clean_json) > 150 else clean_json
             return {"error": f"JSON Error: {str(e)} | AI wrote: {preview}"}
             
     except Exception as e:
@@ -157,7 +165,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
 # --- 3. ASYNC PIPELINE ---
 async def process_ean(sem, session, ean, serp_key, gemini_key, market):
     async with sem:
-        name, img, diag_info = await fetch_basic_info(session, ean, serp_key, market)
+        name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, market)
         if not name:
             return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
@@ -166,8 +174,13 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         if "error" in data:
             return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
 
+        # Pad the images array to always have 3 elements to prevent IndexErrors
+        imgs = img_urls + ["", "", ""]
+
         row = {
-            "Image": img or "",
+            "Image 1": imgs[0],
+            "Image 2": imgs[1],
+            "Image 3": imgs[2],
             "Status": "Success",
             "Key": data.get("key", ""),
             "Item Description": data.get("item_description", name),
@@ -262,7 +275,12 @@ if st.button("🚀 Start Deep Research", type="primary"):
             st.subheader("Results")
             st.data_editor(
                 df,
-                column_config={"Image": st.column_config.ImageColumn()},
+                # Configure the new Image columns to render properly
+                column_config={
+                    "Image 1": st.column_config.ImageColumn(),
+                    "Image 2": st.column_config.ImageColumn(),
+                    "Image 3": st.column_config.ImageColumn()
+                },
                 use_container_width=True,
                 hide_index=True
             )
