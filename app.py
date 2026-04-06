@@ -99,8 +99,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     
     CRITICAL JSON RULES:
-    - Return ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
-    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead.
+    - Return ONLY a valid, raw JSON object. Do NOT wrap it in ```json blocks or any markdown.
+    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
+    - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
@@ -143,7 +144,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
