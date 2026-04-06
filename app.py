@@ -10,48 +10,82 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
-# --- 1. BASIC INFO RETRIEVAL (Name + Multiple Images via SerpAPI) ---
-async def fetch_basic_info(session, ean, serp_key, market_code):
+# --- 1. BASIC INFO RETRIEVAL (Ruby Cascading Logic for Images) ---
+async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
+    """Uses cascading logic to find the exact product name and up to 3 images."""
     gl = market_code.lower()
     diagnostic_log = []
     
-    if not serp_key:
-        return None, [], "Error: Missing SerpAPI Key"
+    product_name = None
+    img_urls = []
+
+    # ATTEMPT 1: EAN-Search API (Exact Database Match)
+    if ean_token:
+        diagnostic_log.append("🔍 Attempt 1: EAN-Search.org API...")
+        ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
+        try:
+            async with session.get(ean_url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and len(data) > 0 and "error" not in data[0]:
+                        product_name = data[0].get("name")
+                        if data[0].get("image"):
+                            img_urls.append(data[0].get("image"))
+                        diagnostic_log.append(f"✅ Found Name via EAN-Search: {product_name}")
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
+
+    # ATTEMPT 2: SerpAPI Text Search (If name is still missing)
+    if not product_name and serp_key:
+        diagnostic_log.append("🔍 Attempt 2: Strict Google Search for Name...")
+        serp_url = "https://serpapi.com/search"
+        try:
+            async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
+                data = await resp.json()
+                organic = data.get("organic_results", [])
+                if organic:
+                    product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                    diagnostic_log.append(f"✅ Found Name via Google: {product_name}")
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ Google text search failed: {e}")
+
+    # If we still don't have a name, we can't proceed
+    if not product_name:
+        return None, [], "❌ Product not found in any database or search."
+
+    # ATTEMPT 3: Fill remaining 3 image slots via SerpAPI Image Search
+    if serp_key and len(img_urls) < 3:
+        diagnostic_log.append("🖼️ Attempt 3: Hunting additional images via Google Images...")
+        serp_url = "https://serpapi.com/search"
         
-    serp_url = "https://serpapi.com/search"
-    diagnostic_log.append(f"🔍 Searching EAN {ean} on Google ({market_code})...")
-    
-    try:
-        async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=20) as resp:
-            data = await resp.json()
-            organic = data.get("organic_results", [])
-            if not organic:
-                return None, [], "❌ Product not found on Google."
-            
-            product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-            diagnostic_log.append(f"✅ Name found: {product_name}")
+        # Using strict EAN search first, fallback to Name + EAN
+        queries = [f'"{ean}"', f'{product_name} {ean}']
+        
+        for query in queries:
+            if len(img_urls) >= 3:
+                break
+                
+            img_params = {"q": query, "tbm": "isch", "gl": gl, "api_key": serp_key}
+            try:
+                async with session.get(serp_url, params=img_params, timeout=10) as img_resp:
+                    img_data = await img_resp.json()
+                    for image_res in img_data.get("images_results", []):
+                        url = image_res.get("original", "")
+                        
+                        # Apply Ruby script blocklist logic
+                        bad_words = ["pinterest", "ebay", "placeholder", "logo", "openfoodfacts", "icon", "thumb"]
+                        if url not in img_urls and all(x not in url.lower() for x in bad_words):
+                            img_urls.append(url)
+                            
+                        if len(img_urls) >= 3:
+                            break
+            except Exception:
+                pass
 
-        diagnostic_log.append(f"🖼️ Searching high-res images for: {product_name}...")
-        img_params = {"q": product_name, "tbm": "isch", "gl": gl, "api_key": serp_key}
-        async with session.get(serp_url, params=img_params, timeout=20) as img_resp:
-            img_data = await img_resp.json()
-            
-            # 🌟 NEW: Extract up to 3 high-quality images
-            img_urls = []
-            for image_res in img_data.get("images_results", []):
-                url = image_res.get("original", "")
-                if all(x not in url.lower() for x in ["pinterest", "placeholder", "logo"]):
-                    img_urls.append(url)
-                if len(img_urls) >= 3: # Stop when we have 3 good images
-                    break
-            
-            diagnostic_log.append(f"✅ Found {len(img_urls)} images.")
-            return product_name, img_urls, "\n".join(diagnostic_log)
-            
-    except Exception as e:
-        return None, [], f"❌ SerpAPI Connection Error: {str(e)}"
+    diagnostic_log.append(f"✅ Secured {len(img_urls)} image(s).")
+    return product_name, img_urls, "\n".join(diagnostic_log)
 
-# --- 2. GEMINI EXTRACTION (Bulletproof JSON & Unlimited Links) ---
+# --- 2. GEMINI EXTRACTION (Robust JSON & Unlimited Links) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key):
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -66,8 +100,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     
     CRITICAL JSON RULES:
     - Return ONLY a raw JSON object. Do NOT wrap it in ```json blocks.
-    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead to avoid breaking the JSON format.
-    - Do not use literal newlines/tabs. 
+    - NEVER use double quotes (") inside your text strings. Use single quotes (') instead.
+    - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
     {{
@@ -114,11 +148,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}],
-                max_output_tokens=8192 # 🌟 Prevents "Unterminated string" by raising the cap
+                max_output_tokens=8192
             )
         )
         
-        # 🌟 Catch Safety Filters blocking the response ('NoneType' error)
         if not response.text:
             return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
         
@@ -136,8 +169,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         unique_urls = list(dict.fromkeys(working_urls))
 
         raw_text = response.text.strip()
-        
-        # 🌟 FOOLPROOF REGEX EXTRACTION: Forces extraction of purely the JSON bracket contents
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not match:
             return {"error": "JSON Error: Could not find JSON object in AI response."}
@@ -145,14 +176,11 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         clean_json = match.group(0)
         
         try:
-            # 🌟 strict=False prevents crashes from invisible control characters like \t or \n
             data = json.loads(clean_json, strict=False)
-            
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
             elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
                 data["sources"] = "No URLs found by AI or Google Grounding"
-                
             return data
             
         except json.JSONDecodeError as e:
@@ -163,9 +191,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         return {"error": f"API Error: {str(e)}"}
 
 # --- 3. ASYNC PIPELINE ---
-async def process_ean(sem, session, ean, serp_key, gemini_key, market):
+async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market):
     async with sem:
-        name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, market)
+        name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         if not name:
             return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
@@ -174,7 +202,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         if "error" in data:
             return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
 
-        # Pad the images array to always have 3 elements to prevent IndexErrors
         imgs = img_urls + ["", "", ""]
 
         row = {
@@ -218,10 +245,10 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, market):
         }
         return {"row": row, "diag": diag_info}
 
-async def run_main(eans, serp_key, gemini_key, market, progress_bar, status_text):
+async def run_main(eans, serp_key, gemini_key, ean_token, market, progress_bar, status_text):
     sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
-        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, market) for ean in eans]
+        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market) for ean in eans]
         
         results = []
         total = len(eans)
@@ -241,6 +268,7 @@ st.title("🔬 Food Data Researcher PRO")
 
 SERP_KEY = os.environ.get("SERPAPI_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "") # 🌟 Added EAN Search API Token support
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -254,12 +282,15 @@ with st.sidebar:
         ]
     )
     market_code = market_selection.split("(")[1].replace(")", "")
+    
+    if not EAN_TOKEN:
+        st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables. Image fallback logic will skip the database check.")
 
 ean_input = st.text_area("Insert EANs (one per line):")
 
 if st.button("🚀 Start Deep Research", type="primary"):
     if not SERP_KEY or not GEMINI_KEY:
-        st.error("API Keys are missing from your environment variables! Please set SERPAPI_KEY and GEMINI_API_KEY on Render.")
+        st.error("API Keys are missing from your environment variables! Please set SERPAPI_KEY and GEMINI_API_KEY.")
         st.stop()
         
     eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
@@ -268,14 +299,13 @@ if st.button("🚀 Start Deep Research", type="primary"):
         status_text = st.empty()
         
         with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
-            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, market_code, progress_bar, status_text))
+            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, progress_bar, status_text))
             
             df = pd.DataFrame(all_data)
             
             st.subheader("Results")
             st.data_editor(
                 df,
-                # Configure the new Image columns to render properly
                 column_config={
                     "Image 1": st.column_config.ImageColumn(),
                     "Image 2": st.column_config.ImageColumn(),
