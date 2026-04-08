@@ -202,11 +202,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             return {"error": "API Error: Request blocked entirely before generating candidates."}
             
         try:
+            # Explicitly check for NoneType to prevent AttributeError
+            if response.text is None:
+                finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
+                return {"error": f"API Error: Empty response text (NoneType). System Finish Reason: {finish_reason}"}
+            
             raw_text = response.text.strip()
-        except ValueError:
-            # Handles the specific exception where response.text throws an error due to empty parts
+        except Exception as e:
+            # Handles any other unexpected exceptions when fetching text
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-            return {"error": f"API Error: Empty response parts. System Finish Reason: {finish_reason}"}
+            return {"error": f"API Error: Could not read response parts. System Finish Reason: {finish_reason}"}
             
         if not raw_text:
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
