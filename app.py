@@ -31,7 +31,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     # ATTEMPT 1: EAN-Search API (Exact Database Match)
     if ean_token:
         diagnostic_log.append("🔍 Attempt 1: EAN-Search.org API...")
-        ean_url = f"[https://api.ean-search.org/api?token=](https://api.ean-search.org/api?token=){ean_token}&op=barcode-lookup&ean={ean}&format=json"
+        ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
         try:
             async with session.get(ean_url, timeout=5) as resp:
                 if resp.status == 200:
@@ -47,10 +47,12 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     # ATTEMPT 2: SerpAPI Text Search (If name is still missing)
     if not product_name and serp_key:
         diagnostic_log.append("🔍 Attempt 2: Strict Google Search for Name...")
-        serp_url = "[https://serpapi.com/search](https://serpapi.com/search)"
+        serp_url = "https://serpapi.com/search"
         try:
             async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
+                if "error" in data:
+                    diagnostic_log.append(f"⚠️ SerpAPI Error: {data['error']}")
                 organic = data.get("organic_results", [])
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
@@ -58,14 +60,15 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
-    # If we still don't have a name, we can't proceed
+    # If we still don't have a name, fallback to letting Gemini figure it out
     if not product_name:
-        return None, [], "❌ Product not found in any database or search."
+        diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
+        product_name = f"Product with EAN {ean}"
 
     # ATTEMPT 3: Fill remaining 3 image slots via SerpAPI Image Search
     if serp_key and len(img_urls) < 3:
         diagnostic_log.append("🖼️ Attempt 3: Hunting additional images via Google Images...")
-        serp_url = "[https://serpapi.com/search](https://serpapi.com/search)"
+        serp_url = "https://serpapi.com/search"
         
         # Using strict EAN search first, fallback to Name + EAN
         queries = [f'"{ean}"', f'{product_name} {ean}']
@@ -249,13 +252,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
 async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text):
     async with sem:
         name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
-        if not name:
-            return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
         data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text)
         
         if "error" in data:
-            return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
+            # Format diagnostic log nicely if it errored out
+            clean_log = diag_info.replace('\n', ' | ')
+            return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
         imgs = img_urls + ["", "", ""]
 
