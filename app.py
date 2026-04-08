@@ -118,7 +118,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     
     CRITICAL JSON RULES:
     - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
-    - If you cannot find any information, fill the fields with "null", but YOU MUST return the JSON structure.
+    - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
     - You are ALLOWED to write a brief summary of your search findings BEFORE the JSON block to help organize your thoughts.
     - However, your final output MUST contain the JSON object wrapped in a ```json markdown block.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
@@ -204,24 +204,31 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             raw_resp_str = str(response)[:500].replace('\n', ' ')
             return {"error": f"API Error: Request blocked entirely. Raw response: {raw_resp_str}"}
             
+        raw_text = ""
         try:
-            # Explicitly check for NoneType to prevent AttributeError and gather robust diagnostics
-            if response.text is None:
+            # Safely iterate through parts because response.text can be None if the model outputs thoughts but no text
+            if response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if getattr(part, 'text', None):
+                        raw_text += part.text + "\n"
+            
+            # Fallback to response.text if parts iteration didn't catch it
+            if not raw_text.strip() and getattr(response, 'text', None):
+                raw_text = response.text
+                
+            raw_text = raw_text.strip()
+            
+            if not raw_text:
                 candidate = response.candidates[0]
                 finish_reason = candidate.finish_reason
                 safety_data = str(candidate.safety_ratings).replace('\n', ' ')
-                usage_data = str(response.usage_metadata).replace('\n', ' ') if hasattr(response, 'usage_metadata') else 'No Usage Data'
-                return {"error": f"API Error: Empty response (NoneType). Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
-            
-            raw_text = response.text.strip()
+                usage_data = str(getattr(response, 'usage_metadata', 'No Usage Data')).replace('\n', ' ')
+                return {"error": f"API Error: Empty text extracted. Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
+                
         except Exception as e:
             # Handles any other unexpected exceptions when fetching text
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-            return {"error": f"API Error: Could not read response parts ({str(e)}). System Finish Reason: {finish_reason}"}
-            
-        if not raw_text:
-            finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-            return {"error": f"API Error: Empty response text. System Finish Reason: {finish_reason}"}
+            return {"error": f"API Error: Could not extract text parts ({str(e)}). System Finish Reason: {finish_reason}"}
         
         working_urls = []
         try:
