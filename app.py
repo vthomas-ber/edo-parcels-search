@@ -107,19 +107,21 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+    6. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
 
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
     --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
-    - Return ONLY a valid, raw JSON object. Do NOT wrap it in ```json blocks or any markdown.
+    - Return ONLY a valid JSON object.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
     - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
     {{
+        "key": "Leave empty or generate a unique ID if appropriate",
         "item_description": "Native language product name/description",
         "category_1": "Level 1 Category",
         "category_2": "Level 2 Category",
@@ -128,6 +130,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "category_5": "Level 5 Category",
         "category_6": "Level 6 Variant or None",
         "categorization_reasoning": "Brief explanation of why these categories were chosen based on ingredients/description",
+        "cn_code": "Customs tariff number if found, else null",
         "brand": "Brand Name",
         "uom": "Unit of Measure (e.g., g, ml, kg)",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
@@ -143,6 +146,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "nutritional_info": "Context (e.g., per 100g or per serving)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
+        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
         "energy_kj": "Value in kJ",
         "fat_g": "Value",
         "saturates_g": "Value",
@@ -151,6 +155,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "protein_g": "Value",
         "fiber_g": "Value",
         "salt_g": "Value",
+        "packaging_length": "Value or null",
+        "packaging_width": "Value or null",
+        "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
         "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. Separate them with commas."
     }}
@@ -164,12 +171,31 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}],
-                max_output_tokens=8192
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+                safety_settings=[
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    )
+                ]
             )
         )
         
         if not response.text:
-            return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
+            return {"error": f"API Error: Empty response. System Finish Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}"}
         
         working_urls = []
         try:
@@ -193,9 +219,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         
         try:
             data = json.loads(clean_json, strict=False)
+            
+            if isinstance(data.get("sources"), list):
+                data["sources"] = ", ".join(str(x) for x in data["sources"])
+                
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
-            elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
+            elif not data.get("sources") or str(data.get("sources")).lower() in ["null", "none", ""]:
                 data["sources"] = "No URLs found by AI or Google Grounding"
             return data
             
@@ -225,8 +255,9 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Image 2": imgs[1],
             "Image 3": imgs[2],
             "Status": "Success",
-            "GTIN / EAN": ean,
+            "Key": data.get("key", ""),
             "Item Description": data.get("item_description", name),
+            "GTIN / EAN": ean,
             "Category L1": data.get("category_1", ""),
             "Category L2": data.get("category_2", ""),
             "Category L3": data.get("category_3", ""),
@@ -234,6 +265,7 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Category L5": data.get("category_5", ""),
             "Category L6": data.get("category_6", ""),
             "Categorization Diagnosis": data.get("categorization_reasoning", ""),
+            "CN Code": data.get("cn_code", ""),
             "Brand": data.get("brand", ""),
             "UoM": data.get("uom", ""),
             "Packaging": data.get("packaging", ""),
@@ -249,6 +281,7 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Nutritional Info": data.get("nutritional_info", ""),
             "Manufacturer Address": data.get("manufacturer_address", ""),
             "Place of Origin": data.get("place_of_origin", ""),
+            "Organic Certification ID": data.get("organic_certification_id", ""),
             "Energy (kJ)": data.get("energy_kj", ""),
             "Fat (g)": data.get("fat_g", ""),
             "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
@@ -257,6 +290,9 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Protein (g)": data.get("protein_g", ""),
             "Fiber (g)": data.get("fiber_g", ""),
             "Salt (g)": data.get("salt_g", ""),
+            "Packaging Length": data.get("packaging_length", ""),
+            "Packaging Width": data.get("packaging_width", ""),
+            "Packaging Height": data.get("packaging_height", ""),
             "Format": data.get("format", ""),
             "Sources": data.get("sources", "")
         }
