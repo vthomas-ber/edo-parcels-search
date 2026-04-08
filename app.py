@@ -117,9 +117,11 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
-    - Return ONLY a single valid JSON object. You may wrap it in a markdown block if necessary. Do not add any conversational text before or after the JSON.
-    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
-    - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
+    - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
+    - If you cannot find any information, fill the fields with "null", but YOU MUST return the JSON structure.
+    - You may wrap the JSON in a ```json markdown block or return it raw.
+    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
+    - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
@@ -199,9 +201,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         if not response.candidates:
             return {"error": "API Error: Request blocked entirely before generating candidates."}
             
-        if not response.text:
-            finish_reason = response.candidates[0].finish_reason
-            return {"error": f"API Error: Empty response. System Finish Reason: {finish_reason}"}
+        try:
+            raw_text = response.text.strip()
+        except ValueError:
+            # Handles the specific exception where response.text throws an error due to empty parts
+            finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
+            return {"error": f"API Error: Empty response parts. System Finish Reason: {finish_reason}"}
+            
+        if not raw_text:
+            finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
+            return {"error": f"API Error: Empty response text. System Finish Reason: {finish_reason}"}
         
         working_urls = []
         try:
@@ -215,8 +224,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             pass
 
         unique_urls = list(dict.fromkeys(working_urls))
-
-        raw_text = response.text.strip()
         
         # Regex to safely find the JSON even if the AI uses markdown formatting
         # NOTE: Using `{3}` instead of literal triple-backticks to prevent UI cutoffs
