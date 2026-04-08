@@ -105,15 +105,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
-    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
+    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+    6. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on executing searches to find the product's ingredients, allergens, and nutritional info.
 
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
     --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
-    - Return ONLY a valid, raw JSON object. Do NOT wrap it in ```json blocks or any markdown.
+    - Return ONLY a single valid JSON object. You may wrap it in a markdown block if necessary. Do not add any conversational text before or after the JSON.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
     - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
@@ -186,17 +187,12 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             )
         )
         
-        # --- NEW: Better Error Diagnosis ---
         if not response.candidates:
             return {"error": "API Error: Request blocked entirely before generating candidates."}
             
         if not response.text:
             finish_reason = response.candidates[0].finish_reason
             return {"error": f"API Error: Empty response. System Finish Reason: {finish_reason}"}
-        # -----------------------------------
-        
-        if not response.text:
-            return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
         
         working_urls = []
         try:
@@ -212,6 +208,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         unique_urls = list(dict.fromkeys(working_urls))
 
         raw_text = response.text.strip()
+        
+        # Regex to safely find the JSON object. This grabs everything from the first { to the last }
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not match:
             return {"error": "JSON Error: Could not find JSON object in AI response."}
