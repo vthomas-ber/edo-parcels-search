@@ -10,7 +10,16 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
-# --- 1. BASIC INFO RETRIEVAL (Ruby Cascading Logic for Images) ---
+@st.cache_data
+def load_taxonomy():
+    """Loads the taxonomy CSV into memory once to prevent repeated disk I/O."""
+    try:
+        with open("taxonomy.csv", "r", encoding="utf-8") as file:
+            return file.read()
+    except FileNotFoundError:
+        return "Level 1,Level 2,Level 3,Level 4,Level 5,Level 6\nError: taxonomy.csv not found."
+
+# --- 1. BASIC INFO RETRIEVAL (Cascading Logic for Images) ---
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     """Uses cascading logic to find the exact product name and up to 3 images."""
     gl = market_code.lower()
@@ -72,7 +81,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                     for image_res in img_data.get("images_results", []):
                         url = image_res.get("original", "")
                         
-                        # Apply Ruby script blocklist logic
+                        # Apply blocklist logic
                         bad_words = ["pinterest", "ebay", "placeholder", "logo", "openfoodfacts", "icon", "thumb"]
                         if url not in img_urls and all(x not in url.lower() for x in bad_words):
                             img_urls.append(url)
@@ -85,8 +94,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     diagnostic_log.append(f"✅ Secured {len(img_urls)} image(s).")
     return product_name, img_urls, "\n".join(diagnostic_log)
 
-# --- 2. GEMINI EXTRACTION (Robust JSON & Unlimited Links) ---
-def run_gemini_sync(ean, product_name, market_code, gemini_key):
+# --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
+def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
@@ -97,6 +106,11 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
+    5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+
+    --- START TAXONOMY REFERENCE (CSV FORMAT) ---
+    {taxonomy_text}
+    --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
     - Return ONLY a valid, raw JSON object. Do NOT wrap it in ```json blocks or any markdown.
@@ -106,9 +120,14 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     
     SCHEMA:
     {{
-        "key": "Leave empty or generate a unique ID if appropriate",
         "item_description": "Native language product name/description",
-        "cn_code": "Customs tariff number if found, else null",
+        "category_1": "Level 1 Category",
+        "category_2": "Level 2 Category",
+        "category_3": "Level 3 Category",
+        "category_4": "Level 4 Category",
+        "category_5": "Level 5 Category",
+        "category_6": "Level 6 Variant or None",
+        "categorization_reasoning": "Brief explanation of why these categories were chosen based on ingredients/description",
         "brand": "Brand Name",
         "uom": "Unit of Measure (e.g., g, ml, kg)",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
@@ -124,7 +143,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "nutritional_info": "Context (e.g., per 100g or per serving)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
-        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
         "energy_kj": "Value in kJ",
         "fat_g": "Value",
         "saturates_g": "Value",
@@ -133,9 +151,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         "protein_g": "Value",
         "fiber_g": "Value",
         "salt_g": "Value",
-        "packaging_length": "Value or null",
-        "packaging_width": "Value or null",
-        "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
         "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. Separate them with commas."
     }}
@@ -192,13 +207,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         return {"error": f"API Error: {str(e)}"}
 
 # --- 3. ASYNC PIPELINE ---
-async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market):
+async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text):
     async with sem:
         name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         if not name:
             return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
-        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key)
+        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text)
         
         if "error" in data:
             return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
@@ -210,10 +225,15 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Image 2": imgs[1],
             "Image 3": imgs[2],
             "Status": "Success",
-            "Key": data.get("key", ""),
-            "Item Description": data.get("item_description", name),
             "GTIN / EAN": ean,
-            "CN Code": data.get("cn_code", ""),
+            "Item Description": data.get("item_description", name),
+            "Category L1": data.get("category_1", ""),
+            "Category L2": data.get("category_2", ""),
+            "Category L3": data.get("category_3", ""),
+            "Category L4": data.get("category_4", ""),
+            "Category L5": data.get("category_5", ""),
+            "Category L6": data.get("category_6", ""),
+            "Categorization Diagnosis": data.get("categorization_reasoning", ""),
             "Brand": data.get("brand", ""),
             "UoM": data.get("uom", ""),
             "Packaging": data.get("packaging", ""),
@@ -229,7 +249,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Nutritional Info": data.get("nutritional_info", ""),
             "Manufacturer Address": data.get("manufacturer_address", ""),
             "Place of Origin": data.get("place_of_origin", ""),
-            "Organic Certification ID": data.get("organic_certification_id", ""),
             "Energy (kJ)": data.get("energy_kj", ""),
             "Fat (g)": data.get("fat_g", ""),
             "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
@@ -238,18 +257,15 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Protein (g)": data.get("protein_g", ""),
             "Fiber (g)": data.get("fiber_g", ""),
             "Salt (g)": data.get("salt_g", ""),
-            "Packaging Length": data.get("packaging_length", ""),
-            "Packaging Width": data.get("packaging_width", ""),
-            "Packaging Height": data.get("packaging_height", ""),
             "Format": data.get("format", ""),
             "Sources": data.get("sources", "")
         }
         return {"row": row, "diag": diag_info}
 
-async def run_main(eans, serp_key, gemini_key, ean_token, market, progress_bar, status_text):
+async def run_main(eans, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
     sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
-        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market) for ean in eans]
+        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text) for ean in eans]
         
         results = []
         total = len(eans)
@@ -269,7 +285,10 @@ st.title("🔬 Food Data Researcher PRO")
 
 SERP_KEY = os.environ.get("SERPAPI_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "") # 🌟 Added EAN Search API Token support
+EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "") 
+
+# Load taxonomy into memory
+taxonomy_text = load_taxonomy()
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -286,6 +305,9 @@ with st.sidebar:
     
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables. Image fallback logic will skip the database check.")
+        
+    if "Error" in taxonomy_text:
+        st.error("⚠️ taxonomy.csv missing from project root! Categorization will fail.")
 
 ean_input = st.text_area("Insert EANs (one per line):")
 
@@ -300,7 +322,7 @@ if st.button("🚀 Start Deep Research", type="primary"):
         status_text = st.empty()
         
         with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
-            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, progress_bar, status_text))
+            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, taxonomy_text, progress_bar, status_text))
             
             df = pd.DataFrame(all_data)
             
