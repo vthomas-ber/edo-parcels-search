@@ -119,7 +119,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     CRITICAL JSON RULES:
     - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
     - If you cannot find any information, fill the fields with "null", but YOU MUST return the JSON structure.
-    - You may wrap the JSON in a ```json markdown block or return it raw.
+    - You are ALLOWED to write a brief summary of your search findings BEFORE the JSON block to help organize your thoughts.
+    - However, your final output MUST contain the JSON object wrapped in a ```json markdown block.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
     - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
@@ -199,19 +200,24 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         )
         
         if not response.candidates:
-            return {"error": "API Error: Request blocked entirely before generating candidates."}
+            # Better diagnostics for completely blocked requests
+            raw_resp_str = str(response)[:500].replace('\n', ' ')
+            return {"error": f"API Error: Request blocked entirely. Raw response: {raw_resp_str}"}
             
         try:
-            # Explicitly check for NoneType to prevent AttributeError
+            # Explicitly check for NoneType to prevent AttributeError and gather robust diagnostics
             if response.text is None:
-                finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-                return {"error": f"API Error: Empty response text (NoneType). System Finish Reason: {finish_reason}"}
+                candidate = response.candidates[0]
+                finish_reason = candidate.finish_reason
+                safety_data = str(candidate.safety_ratings).replace('\n', ' ')
+                usage_data = str(response.usage_metadata).replace('\n', ' ') if hasattr(response, 'usage_metadata') else 'No Usage Data'
+                return {"error": f"API Error: Empty response (NoneType). Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
             
             raw_text = response.text.strip()
         except Exception as e:
             # Handles any other unexpected exceptions when fetching text
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-            return {"error": f"API Error: Could not read response parts. System Finish Reason: {finish_reason}"}
+            return {"error": f"API Error: Could not read response parts ({str(e)}). System Finish Reason: {finish_reason}"}
             
         if not raw_text:
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
@@ -230,15 +236,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
 
         unique_urls = list(dict.fromkeys(working_urls))
         
-        # Regex to safely find the JSON even if the AI uses markdown formatting
-        # NOTE: Using `{3}` instead of literal triple-backticks to prevent UI cutoffs
+        # Regex to safely find the JSON even if the AI uses markdown formatting or pre-text
         match = re.search(r'`{3}(?:json)?\s*(\{[\s\S]*?\})\s*`{3}', raw_text)
         if match:
             clean_json = match.group(1)
         else:
             match = re.search(r'\{[\s\S]*\}', raw_text)
             if not match:
-                return {"error": "JSON Error: Could not find JSON object in AI response."}
+                # Capture the start of the rogue text to see what it said instead of JSON
+                rogue_preview = raw_text[:200].replace('\n', ' ')
+                return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
             clean_json = match.group(0)
         
         try:
