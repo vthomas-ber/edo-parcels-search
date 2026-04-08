@@ -103,6 +103,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
     - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
+    - EVEN IF YOU FIND NO INFORMATION AT ALL, YOU MUST STILL RETURN THE EXACT JSON DICTIONARY WITH ALL VALUES SET TO null. DO NOT write conversational text or apologize.
     
     SCHEMA:
     {{
@@ -172,7 +173,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
         raw_text = response.text.strip()
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not match:
-            return {"error": "JSON Error: Could not find JSON object in AI response."}
+            # Provide a preview of what the AI actually wrote so the user isn't left guessing
+            preview = raw_text[:150].replace('\n', ' ') + "..." if len(raw_text) > 150 else raw_text
+            return {"error": f"JSON Error: No JSON brackets found. AI wrote: {preview}"}
             
         clean_json = match.group(0)
         
