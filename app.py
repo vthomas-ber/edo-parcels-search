@@ -168,23 +168,32 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
                 safety_settings=[
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
                     ),
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
                     ),
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
                     ),
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
                     )
                 ]
             )
         )
+        
+        # --- NEW: Better Error Diagnosis ---
+        if not response.candidates:
+            return {"error": "API Error: Request blocked entirely before generating candidates."}
+            
+        if not response.text:
+            finish_reason = response.candidates[0].finish_reason
+            return {"error": f"API Error: Empty response. System Finish Reason: {finish_reason}"}
+        # -----------------------------------
         
         if not response.text:
             return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
