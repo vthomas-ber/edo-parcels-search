@@ -164,7 +164,25 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}],
-                max_output_tokens=8192
+                max_output_tokens=8192,
+                safety_settings=[
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    )
+                ]
             )
         )
         
@@ -193,10 +211,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         
         try:
             data = json.loads(clean_json, strict=False)
+            
+            # Force 'sources' to be a string if the AI returned a list
+            if isinstance(data.get("sources"), list):
+                data["sources"] = ", ".join(str(x) for x in data["sources"])
+                
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
-            elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
+            elif not data.get("sources") or str(data.get("sources")).lower() in ["null", "none", ""]:
                 data["sources"] = "No URLs found by AI or Google Grounding"
+                
             return data
             
         except json.JSONDecodeError as e:
