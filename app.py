@@ -10,7 +10,16 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
-# --- 1. BASIC INFO RETRIEVAL (Ruby Cascading Logic for Images) ---
+@st.cache_data
+def load_taxonomy():
+    """Loads the taxonomy CSV into memory once to prevent repeated disk I/O."""
+    try:
+        with open("taxonomy.csv", "r", encoding="utf-8") as file:
+            return file.read()
+    except FileNotFoundError:
+        return "Level 1,Level 2,Level 3,Level 4,Level 5,Level 6\nError: taxonomy.csv not found."
+
+# --- 1. BASIC INFO RETRIEVAL (Cascading Logic for Images) ---
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     """Uses cascading logic to find the exact product name and up to 3 images."""
     gl = market_code.lower()
@@ -42,6 +51,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         try:
             async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
+                if "error" in data:
+                    diagnostic_log.append(f"⚠️ SerpAPI Error: {data['error']}")
                 organic = data.get("organic_results", [])
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
@@ -49,9 +60,10 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
-    # If we still don't have a name, we can't proceed
+    # If we still don't have a name, fallback to letting Gemini figure it out
     if not product_name:
-        return None, [], "❌ Product not found in any database or search."
+        diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
+        product_name = f"Product with EAN {ean}"
 
     # ATTEMPT 3: Fill remaining 3 image slots via SerpAPI Image Search
     if serp_key and len(img_urls) < 3:
@@ -72,7 +84,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                     for image_res in img_data.get("images_results", []):
                         url = image_res.get("original", "")
                         
-                        # Apply Ruby script blocklist logic
+                        # Apply blocklist logic
                         bad_words = ["pinterest", "ebay", "placeholder", "logo", "openfoodfacts", "icon", "thumb"]
                         if url not in img_urls and all(x not in url.lower() for x in bad_words):
                             img_urls.append(url)
@@ -85,8 +97,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     diagnostic_log.append(f"✅ Secured {len(img_urls)} image(s).")
     return product_name, img_urls, "\n".join(diagnostic_log)
 
-# --- 2. GEMINI EXTRACTION (Robust JSON & Unlimited Links) ---
-def run_gemini_sync(ean, product_name, market_code, gemini_key):
+# --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
+def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
@@ -96,18 +108,34 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
-    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, return "null".
+    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
+    5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+    6. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
+
+    --- START TAXONOMY REFERENCE (CSV FORMAT) ---
+    {taxonomy_text}
+    --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
-    - Return ONLY a valid, raw JSON object. Do NOT wrap it in ```json blocks or any markdown.
-    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure (e.g., "brand": "Cadbury").
-    - If you need to use quotes INSIDE a string value, use single quotes ('). Example: "item_description": "Kellogg's Corn Flakes" (CORRECT). NEVER use unescaped double quotes inside a value.
+    - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
+    - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
+    - You are ALLOWED to write a brief summary of your search findings BEFORE the JSON block to help organize your thoughts.
+    - However, your final output MUST contain the JSON object wrapped in a ```json markdown block.
+    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
+    - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
     {{
         "key": "Leave empty or generate a unique ID if appropriate",
         "item_description": "Native language product name/description",
+        "category_1": "Level 1 Category",
+        "category_2": "Level 2 Category",
+        "category_3": "Level 3 Category",
+        "category_4": "Level 4 Category",
+        "category_5": "Level 5 Category",
+        "category_6": "Level 6 Variant or None",
+        "categorization_reasoning": "Brief explanation of why these categories were chosen based on ingredients/description",
         "cn_code": "Customs tariff number if found, else null",
         "brand": "Brand Name",
         "uom": "Unit of Measure (e.g., g, ml, kg)",
@@ -144,17 +172,63 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 tools=[{"google_search": {}}],
-                max_output_tokens=65536
+                max_output_tokens=8192,
+                safety_settings=[
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    ),
+                    types.SafetySetting(
+                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                    )
+                ]
             )
         )
         
-        if not response.text:
-            return {"error": "API Error: Empty response (Google Safety Filter triggered)"}
+        if not response.candidates:
+            # Better diagnostics for completely blocked requests
+            raw_resp_str = str(response)[:500].replace('\n', ' ')
+            return {"error": f"API Error: Request blocked entirely. Raw response: {raw_resp_str}"}
+            
+        raw_text = ""
+        try:
+            # Safely iterate through parts because response.text can be None if the model outputs thoughts but no text
+            if response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if getattr(part, 'text', None):
+                        raw_text += part.text + "\n"
+            
+            # Fallback to response.text if parts iteration didn't catch it
+            if not raw_text.strip() and getattr(response, 'text', None):
+                raw_text = response.text
+                
+            raw_text = raw_text.strip()
+            
+            if not raw_text:
+                candidate = response.candidates[0]
+                finish_reason = candidate.finish_reason
+                safety_data = str(candidate.safety_ratings).replace('\n', ' ')
+                usage_data = str(getattr(response, 'usage_metadata', 'No Usage Data')).replace('\n', ' ')
+                return {"error": f"API Error: Empty text extracted. Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
+                
+        except Exception as e:
+            # Handles any other unexpected exceptions when fetching text
+            finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
+            return {"error": f"API Error: Could not extract text parts ({str(e)}). System Finish Reason: {finish_reason}"}
         
         working_urls = []
         try:
@@ -168,40 +242,49 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key):
             pass
 
         unique_urls = list(dict.fromkeys(working_urls))
-
-        raw_text = response.text.strip()
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if not match:
-            return {"error": "JSON Error: Could not find JSON object in AI response."}
-            
-        clean_json = match.group(0)
+        
+        # Regex to safely find the JSON even if the AI uses markdown formatting or pre-text
+        match = re.search(r'`{3}(?:json)?\s*(\{[\s\S]*?\})\s*`{3}', raw_text)
+        if match:
+            clean_json = match.group(1)
+        else:
+            match = re.search(r'\{[\s\S]*\}', raw_text)
+            if not match:
+                # Capture the start of the rogue text to see what it said instead of JSON
+                rogue_preview = raw_text[:200].replace('\n', ' ')
+                return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
+            clean_json = match.group(0)
         
         try:
             data = json.loads(clean_json, strict=False)
+            
+            if isinstance(data.get("sources"), list):
+                data["sources"] = ", ".join(str(x) for x in data["sources"])
+                
             if unique_urls:
                 data["sources"] = ", ".join(unique_urls)
-            elif not data.get("sources") or data.get("sources").lower() in ["null", "none", ""]:
+            elif not data.get("sources") or str(data.get("sources")).lower() in ["null", "none", ""]:
                 data["sources"] = "No URLs found by AI or Google Grounding"
+                
             return data
             
         except json.JSONDecodeError as e:
-            preview = clean_json[:150].replace('\n', ' ') + "..." if len(clean_json) > 150 else clean_json
-            return {"error": f"JSON Error: {str(e)} | AI wrote: {preview}"}
+            return {"error": f"JSON Error: {str(e)}"}
             
     except Exception as e:
         return {"error": f"API Error: {str(e)}"}
 
 # --- 3. ASYNC PIPELINE ---
-async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market):
+async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text):
     async with sem:
         name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
-        if not name:
-            return {"row": {"GTIN / EAN": ean, "Status": "Not Found"}, "diag": diag_info}
         
-        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key)
+        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text)
         
         if "error" in data:
-            return {"row": {"GTIN / EAN": ean, "Status": data["error"]}, "diag": diag_info}
+            # Format diagnostic log nicely if it errored out
+            clean_log = diag_info.replace('\n', ' | ')
+            return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
         imgs = img_urls + ["", "", ""]
 
@@ -213,6 +296,13 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Key": data.get("key", ""),
             "Item Description": data.get("item_description", name),
             "GTIN / EAN": ean,
+            "Category L1": data.get("category_1", ""),
+            "Category L2": data.get("category_2", ""),
+            "Category L3": data.get("category_3", ""),
+            "Category L4": data.get("category_4", ""),
+            "Category L5": data.get("category_5", ""),
+            "Category L6": data.get("category_6", ""),
+            "Categorization Diagnosis": data.get("categorization_reasoning", ""),
             "CN Code": data.get("cn_code", ""),
             "Brand": data.get("brand", ""),
             "UoM": data.get("uom", ""),
@@ -246,10 +336,10 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
         }
         return {"row": row, "diag": diag_info}
 
-async def run_main(eans, serp_key, gemini_key, ean_token, market, progress_bar, status_text):
+async def run_main(eans, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
     sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
-        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market) for ean in eans]
+        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text) for ean in eans]
         
         results = []
         total = len(eans)
@@ -269,7 +359,10 @@ st.title("🔬 Food Data Researcher PRO")
 
 SERP_KEY = os.environ.get("SERPAPI_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "") # 🌟 Added EAN Search API Token support
+EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "") 
+
+# Load taxonomy into memory
+taxonomy_text = load_taxonomy()
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -286,6 +379,9 @@ with st.sidebar:
     
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables. Image fallback logic will skip the database check.")
+        
+    if "Error" in taxonomy_text:
+        st.error("⚠️ taxonomy.csv missing from project root! Categorization will fail.")
 
 ean_input = st.text_area("Insert EANs (one per line):")
 
@@ -300,7 +396,7 @@ if st.button("🚀 Start Deep Research", type="primary"):
         status_text = st.empty()
         
         with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
-            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, progress_bar, status_text))
+            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, taxonomy_text, progress_bar, status_text))
             
             df = pd.DataFrame(all_data)
             
