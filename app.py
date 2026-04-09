@@ -109,6 +109,18 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         
         # Only search the strict EAN to avoid unrelated products
         queries = [f'"{ean}"']
+        
+        for query in queries:
+            if len(img_urls) >= 3:
+                break
+                
+            img_params = {"q": query, "tbm": "isch", "gl": gl, "api_key": serp_key}
+            try:
+                async with session.get(serp_url, params=img_params, timeout=10) as img_resp:
+                    img_data = await img_resp.json()
+                    for image_res in img_data.get("images_results", []):
+                        url = image_res.get("original", "")
+                        
                         # --- ADVANCED IMAGE QUALITY FILTER ---
                         url_lower = url.lower()
                         
