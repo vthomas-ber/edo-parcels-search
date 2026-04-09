@@ -119,15 +119,15 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     CRITICAL JSON RULES:
     - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
     - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
+    - To avoid RECITATION errors, do NOT copy-paste long paragraphs of text verbatim.
     - You are ALLOWED to write a brief summary of your search findings BEFORE the JSON block to help organize your thoughts.
-    - However, your final output MUST contain the JSON object wrapped in a ```json markdown block.
+    - However, your final output MUST contain the JSON object.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
     - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
     {{
-        "key": "Leave empty or generate a unique ID if appropriate",
         "item_description": "Native language product name/description",
         "category_1": "Level 1 Category",
         "category_2": "Level 2 Category",
@@ -136,7 +136,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "category_5": "Level 5 Category",
         "category_6": "Level 6 Variant or None",
         "categorization_reasoning": "Brief explanation of why these categories were chosen based on ingredients/description",
-        "cn_code": "Customs tariff number if found, else null",
         "brand": "Brand Name",
         "uom": "Unit of Measure (e.g., g, ml, kg)",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
@@ -152,7 +151,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "nutritional_info": "Context (e.g., per 100g or per serving)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
-        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
         "energy_kj": "Value in kJ",
         "fat_g": "Value",
         "saturates_g": "Value",
@@ -161,9 +159,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "protein_g": "Value",
         "fiber_g": "Value",
         "salt_g": "Value",
-        "packaging_length": "Value or null",
-        "packaging_width": "Value or null",
-        "packaging_height": "Value or null",
         "format": "e.g., multipack, sharing size, single",
         "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. Separate them with commas."
     }}
@@ -172,7 +167,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
@@ -243,17 +238,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
 
         unique_urls = list(dict.fromkeys(working_urls))
         
-        # Regex to safely find the JSON even if the AI uses markdown formatting or pre-text
-        match = re.search(r'`{3}(?:json)?\s*(\{[\s\S]*?\})\s*`{3}', raw_text)
-        if match:
-            clean_json = match.group(1)
+        # Bulletproof JSON extraction: Find the first '{' and last '}'
+        start_idx = raw_text.find('{')
+        end_idx = raw_text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            clean_json = raw_text[start_idx:end_idx+1]
         else:
-            match = re.search(r'\{[\s\S]*\}', raw_text)
-            if not match:
-                # Capture the start of the rogue text to see what it said instead of JSON
-                rogue_preview = raw_text[:200].replace('\n', ' ')
-                return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
-            clean_json = match.group(0)
+            # Capture the start of the rogue text to see what it said instead of JSON
+            rogue_preview = raw_text[:200].replace('\n', ' ')
+            return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
         
         try:
             data = json.loads(clean_json, strict=False)
@@ -293,7 +287,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Image 2": imgs[1],
             "Image 3": imgs[2],
             "Status": "Success",
-            "Key": data.get("key", ""),
             "Item Description": data.get("item_description", name),
             "GTIN / EAN": ean,
             "Category L1": data.get("category_1", ""),
@@ -303,7 +296,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Category L5": data.get("category_5", ""),
             "Category L6": data.get("category_6", ""),
             "Categorization Diagnosis": data.get("categorization_reasoning", ""),
-            "CN Code": data.get("cn_code", ""),
             "Brand": data.get("brand", ""),
             "UoM": data.get("uom", ""),
             "Packaging": data.get("packaging", ""),
@@ -319,7 +311,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Nutritional Info": data.get("nutritional_info", ""),
             "Manufacturer Address": data.get("manufacturer_address", ""),
             "Place of Origin": data.get("place_of_origin", ""),
-            "Organic Certification ID": data.get("organic_certification_id", ""),
             "Energy (kJ)": data.get("energy_kj", ""),
             "Fat (g)": data.get("fat_g", ""),
             "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
@@ -328,9 +319,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Protein (g)": data.get("protein_g", ""),
             "Fiber (g)": data.get("fiber_g", ""),
             "Salt (g)": data.get("salt_g", ""),
-            "Packaging Length": data.get("packaging_length", ""),
-            "Packaging Width": data.get("packaging_width", ""),
-            "Packaging Height": data.get("packaging_height", ""),
             "Format": data.get("format", ""),
             "Sources": data.get("sources", "")
         }
