@@ -19,6 +19,23 @@ def load_taxonomy():
     except FileNotFoundError:
         return "Level 1,Level 2,Level 3,Level 4,Level 5,Level 6\nError: taxonomy.csv not found."
 
+async def fetch_og_image(session, url):
+    """Visits a retailer URL and extracts the high-quality Open Graph image."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=5) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                # Search for the standard Open Graph image meta tag
+                match = re.search(r'<meta[^>]*property=[\'"]og:image[\'"][^>]*content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return None
+
 # --- 1. BASIC INFO RETRIEVAL (Cascading Logic for Images) ---
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     """Uses cascading logic to find the exact product name and up to 3 images."""
@@ -27,6 +44,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     
     product_name = None
     img_urls = []
+    retailer_urls = []
 
     # ATTEMPT 1: EAN-Search API (Exact Database Match)
     if ean_token:
@@ -57,6 +75,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
                     diagnostic_log.append(f"✅ Found Name via Google: {product_name}")
+                    # Save top retailer URLs for our new image scraper
+                    retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
@@ -65,28 +85,44 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
         product_name = f"Product with EAN {ean}"
 
-    # ATTEMPT 3: Fill remaining 3 image slots via SerpAPI Image Search
-    if serp_key and len(img_urls) < 3:
-        diagnostic_log.append("🖼️ Attempt 3: Hunting additional images via Google Images...")
-        serp_url = "https://serpapi.com/search"
+    # ATTEMPT 3: Scrape High-Quality Images directly from Retailer URLs
+    if retailer_urls and len(img_urls) < 3:
+        diagnostic_log.append("🌐 Attempt 3: Extracting official images directly from Retailer URLs...")
         
-        # Using strict EAN search first, fallback to Name + EAN
-        queries = [f'"{ean}"', f'{product_name} {ean}']
+        # Concurrently visit the top retailer pages
+        tasks = [fetch_og_image(session, url) for url in retailer_urls]
+        og_images = await asyncio.gather(*tasks)
         
-        for query in queries:
+        for img in og_images:
+            if img and img not in img_urls:
+                url_lower = img.lower()
+                bad_patterns = ["placeholder", "logo", "icon", "thumb", "avatar", "svg"]
+                if not any(bad in url_lower for bad in bad_patterns):
+                    img_urls.append(img)
             if len(img_urls) >= 3:
                 break
-                
-            img_params = {"q": query, "tbm": "isch", "gl": gl, "api_key": serp_key}
-            try:
-                async with session.get(serp_url, params=img_params, timeout=10) as img_resp:
-                    img_data = await img_resp.json()
-                    for image_res in img_data.get("images_results", []):
-                        url = image_res.get("original", "")
+
+    # ATTEMPT 4: Fallback to SerpAPI Google Images Search
+    if serp_key and len(img_urls) < 3:
+        diagnostic_log.append("🖼️ Attempt 4: Fallback to Google Images search...")
+        serp_url = "https://serpapi.com/search"
+        
+        # Only search the strict EAN to avoid unrelated products
+        queries = [f'"{ean}"']
+                        # --- ADVANCED IMAGE QUALITY FILTER ---
+                        url_lower = url.lower()
                         
-                        # Apply blocklist logic
-                        bad_words = ["pinterest", "ebay", "placeholder", "logo", "openfoodfacts", "icon", "thumb"]
-                        if url not in img_urls and all(x not in url.lower() for x in bad_words):
+                        # 1. Block low-res thumbnails, placeholders, and non-product domains
+                        bad_patterns = [
+                            "pinterest", "ebay", "placeholder", "logo", "openfoodfacts", 
+                            "icon", "thumb", "avatar", "sprite", "vector",
+                            "s192", "width=250", "160x160", "200x200", "250x250", "300x300"
+                        ]
+                        
+                        # 2. Block Amazon UI composites (URLs with commas or dynamic crop modifiers)
+                        is_bad_amazon = "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower)
+                        
+                        if url not in img_urls and not any(bad in url_lower for bad in bad_patterns) and not is_bad_amazon:
                             img_urls.append(url)
                             
                         if len(img_urls) >= 3:
@@ -151,6 +187,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "nutritional_info": "Context (e.g., per 100g or per serving)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
+        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
         "energy_kj": "Value in kJ",
         "fat_g": "Value",
         "saturates_g": "Value",
@@ -159,15 +196,14 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         "protein_g": "Value",
         "fiber_g": "Value",
         "salt_g": "Value",
-        "format": "e.g., multipack, sharing size, single",
-        "sources": "Provide ALL the exact, full URLs (starting with https://) you visited to find this data. Separate them with commas."
+        "sources": ["Array of full URLs (starting with https://) you visited to find this data"]
     }}
     """
     
     client = genai.Client(api_key=gemini_key)
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
@@ -252,13 +288,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         try:
             data = json.loads(clean_json, strict=False)
             
-            if isinstance(data.get("sources"), list):
-                data["sources"] = ", ".join(str(x) for x in data["sources"])
-                
+            # Keep sources as a list for individual columns
             if unique_urls:
-                data["sources"] = ", ".join(unique_urls)
-            elif not data.get("sources") or str(data.get("sources")).lower() in ["null", "none", ""]:
-                data["sources"] = "No URLs found by AI or Google Grounding"
+                data["sources"] = unique_urls
+            elif isinstance(data.get("sources"), str):
+                data["sources"] = [s.strip() for s in data.get("sources").split(",") if s.strip()]
+            elif not isinstance(data.get("sources"), list):
+                data["sources"] = []
                 
             return data
             
@@ -281,14 +317,21 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
         imgs = img_urls + ["", "", ""]
+        
+        # Safely pad the sources list so we always have at least 5 elements for the columns
+        sources = data.get("sources", [])
+        if isinstance(sources, str):
+            sources = [s.strip() for s in sources.split(",") if s.strip()]
+        srcs = (sources + ["", "", "", "", ""])[:5]
 
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
             "Image 3": imgs[2],
             "Status": "Success",
-            "Item Description": data.get("item_description", name),
             "GTIN / EAN": ean,
+            "Product Name": name,
+            "Item Description": data.get("item_description", name),
             "Category L1": data.get("category_1", ""),
             "Category L2": data.get("category_2", ""),
             "Category L3": data.get("category_3", ""),
@@ -311,6 +354,7 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Nutritional Info": data.get("nutritional_info", ""),
             "Manufacturer Address": data.get("manufacturer_address", ""),
             "Place of Origin": data.get("place_of_origin", ""),
+            "Organic Certification ID": data.get("organic_certification_id", ""),
             "Energy (kJ)": data.get("energy_kj", ""),
             "Fat (g)": data.get("fat_g", ""),
             "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
@@ -319,8 +363,11 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Protein (g)": data.get("protein_g", ""),
             "Fiber (g)": data.get("fiber_g", ""),
             "Salt (g)": data.get("salt_g", ""),
-            "Format": data.get("format", ""),
-            "Sources": data.get("sources", "")
+            "Source 1": srcs[0],
+            "Source 2": srcs[1],
+            "Source 3": srcs[2],
+            "Source 4": srcs[3],
+            "Source 5": srcs[4]
         }
         return {"row": row, "diag": diag_info}
 
@@ -394,7 +441,12 @@ if st.button("🚀 Start Deep Research", type="primary"):
                 column_config={
                     "Image 1": st.column_config.ImageColumn(),
                     "Image 2": st.column_config.ImageColumn(),
-                    "Image 3": st.column_config.ImageColumn()
+                    "Image 3": st.column_config.ImageColumn(),
+                    "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
+                    "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
+                    "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
+                    "Source 4": st.column_config.LinkColumn(display_text="Link 4"),
+                    "Source 5": st.column_config.LinkColumn(display_text="Link 5")
                 },
                 use_container_width=True,
                 hide_index=True
