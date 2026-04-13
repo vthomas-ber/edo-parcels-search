@@ -178,6 +178,9 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list):
+    market_upper = market_code.upper()
+    goldmine_sites = GOLDMINE.get(market_upper, "Major Tier-1 Supermarkets")
+    
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
@@ -186,11 +189,12 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     CORE DIRECTIVES: 
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Item Description, Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories (category_1 to 6) MUST remain exactly as they appear in the English CSV.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
+    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site. Explain your choice in the reliability_reasoning field.
 
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
@@ -207,27 +211,29 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     SCHEMA:
     {{
         "chain_of_thought": "Step-by-step reasoning of how you found the data, translated it, and read the images to ensure accuracy.",
-        "item_description": "Native language product name/description",
-        "category_1": "Level 1 Category",
-        "category_2": "Level 2 Category",
-        "category_3": "Level 3 Category",
-        "category_4": "Level 4 Category",
-        "category_5": "Level 5 Category",
-        "category_6": "Level 6 Variant or None",
-        "categorization_reasoning": "Brief explanation of why these categories were chosen based on ingredients/description",
+        "food_info_reliability": "H, M, or L",
+        "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
+        "item_description": "Native language product name/description (Translated to {market_code} market language)",
+        "category_1": "Level 1 Category (English)",
+        "category_2": "Level 2 Category (English)",
+        "category_3": "Level 3 Category (English)",
+        "category_4": "Level 4 Category (English)",
+        "category_5": "Level 5 Category (English)",
+        "category_6": "Level 6 Variant or None (English)",
+        "categorization_reasoning": "Brief explanation of why these categories were chosen",
         "brand": "Brand Name",
-        "uom": "Unit of Measure (e.g., g, ml, kg)",
+        "uom": "Strictly write 'g' (or 'ml' for liquids). Do not write 'gram', 'grams', 'gr'.",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
         "fragile_item": "Yes or No",
         "net_weight": "Weight/Volume number only",
         "gross_weight": "Gross weight if found, else null",
         "organic_product": "Yes or No",
-        "dietary": "Vegetarian, Vegan, Halal, Kosher, Gluten-free, etc.",
+        "dietary": "Vegetarian, Vegan, Halal, Kosher, Gluten-free, etc. (Translated to {market_code} language)",
         "net_weight_customer_facing": "How weight is displayed on pack",
-        "ingredients": "Full list as a single string",
-        "allergens": "List as a single string",
-        "may_contain": "List as a single string",
-        "nutritional_info": "Context (e.g., per 100g or per serving)",
+        "ingredients": "Full list as a single string (Translated to {market_code} language)",
+        "allergens": "List as a single string (Translated to {market_code} language)",
+        "may_contain": "List as a single string (Translated to {market_code} language)",
+        "nutritional_info": "Context (e.g., per 100g or per serving) (Translated to {market_code} language)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
         "organic_certification_id": "e.g., DE-ÖKO-001 or null",
@@ -381,6 +387,8 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "GTIN / EAN": ean,
             "Product Name": name,
             "Item Description": data.get("item_description", name),
+            "Info Reliability": data.get("food_info_reliability", ""),
+            "Reliability Reasoning": data.get("reliability_reasoning", ""),
             "Chain of Thought": data.get("chain_of_thought", ""),
             "Category L1": data.get("category_1", ""),
             "Category L2": data.get("category_2", ""),
