@@ -10,6 +10,24 @@ from google.genai import types
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
+# --- GOLDMINE SITES ---
+GOLDMINE = {
+    "FR": "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
+    "UK": "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:tesco.com",
+    "NL": "site:ah.nl OR site:jumbo.com OR site:plus.nl",
+    "BE": "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
+    "DE": "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
+    "AT": "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:hofer.at",
+    "DK": "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk",
+    "IT": "site:carrefour.it OR site:conad.it OR site:coop.it",
+    "ES": "site:carrefour.es OR site:mercadona.es OR site:dia.es",
+    "SE": "site:ica.se OR site:coop.se OR site:willys.se",
+    "NO": "site:oda.com OR site:meny.no OR site:holdbart.no",
+    "FI": "site:k-ruoka.fi OR site:s-kaupat.fi",
+    "PL": "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl",
+}
+GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
+
 @st.cache_data
 def load_taxonomy():
     """Loads the taxonomy CSV into memory once to prevent repeated disk I/O."""
@@ -28,10 +46,21 @@ async def fetch_og_image(session, url):
         async with session.get(url, headers=headers, timeout=5) as resp:
             if resp.status == 200:
                 html = await resp.text()
-                # Search for the standard Open Graph image meta tag
                 match = re.search(r'<meta[^>]*property=[\'"]og:image[\'"][^>]*content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
                 if match:
                     return match.group(1)
+    except Exception:
+        pass
+    return None
+
+async def fetch_image_bytes(session, url):
+    """Downloads image bytes to pass to Gemini Vision."""
+    try:
+        async with session.get(url, timeout=5) as resp:
+            if resp.status == 200:
+                mime = resp.headers.get("content-type", "image/jpeg")
+                data = await resp.read()
+                return {"mime": mime, "data": data}
     except Exception:
         pass
     return None
@@ -40,6 +69,7 @@ async def fetch_og_image(session, url):
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     """Uses cascading logic to find the exact product name and up to 3 images."""
     gl = market_code.lower()
+    market_upper = market_code.upper()
     diagnostic_log = []
     
     product_name = None
@@ -62,25 +92,34 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
 
-    # ATTEMPT 2: SerpAPI Text Search (If name is still missing)
+    # ATTEMPT 2: SerpAPI Text Search (Goldmine + Generic)
     if not product_name and serp_key:
-        diagnostic_log.append("🔍 Attempt 2: Strict Google Search for Name...")
+        diagnostic_log.append("🔍 Attempt 2: Goldmine Google Search for Name...")
         serp_url = "https://serpapi.com/search"
+        goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
+        
         try:
-            async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
+            # First try Goldmine specific search
+            async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
-                if "error" in data:
-                    diagnostic_log.append(f"⚠️ SerpAPI Error: {data['error']}")
                 organic = data.get("organic_results", [])
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    diagnostic_log.append(f"✅ Found Name via Google: {product_name}")
-                    # Save top retailer URLs for our new image scraper
+                    diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
                     retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
+                else:
+                    # Fallback to bare GTIN global search
+                    diagnostic_log.append("⚠️ Goldmine failed, falling back to global bare GTIN search...")
+                    async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
+                        data2 = await resp2.json()
+                        organic2 = data2.get("organic_results", [])
+                        if organic2:
+                            product_name = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
+                            diagnostic_log.append(f"✅ Found Name via Global Search: {product_name}")
+                            retailer_urls = [res.get("link") for res in organic2[:4] if "link" in res]
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
-    # If we still don't have a name, fallback to letting Gemini figure it out
     if not product_name:
         diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
         product_name = f"Product with EAN {ean}"
@@ -88,8 +127,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     # ATTEMPT 3: Scrape High-Quality Images directly from Retailer URLs
     if retailer_urls and len(img_urls) < 3:
         diagnostic_log.append("🌐 Attempt 3: Extracting official images directly from Retailer URLs...")
-        
-        # Concurrently visit the top retailer pages
         tasks = [fetch_og_image(session, url) for url in retailer_urls]
         og_images = await asyncio.gather(*tasks)
         
@@ -106,8 +143,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     if serp_key and len(img_urls) < 3:
         diagnostic_log.append("🖼️ Attempt 4: Fallback to Google Images search...")
         serp_url = "https://serpapi.com/search"
-        
-        # Only search the strict EAN to avoid unrelated products
         queries = [f'"{ean}"']
         
         for query in queries:
@@ -123,15 +158,11 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                         
                         # --- ADVANCED IMAGE QUALITY FILTER ---
                         url_lower = url.lower()
-                        
-                        # 1. Block low-res thumbnails, placeholders, and non-product domains
                         bad_patterns = [
                             "pinterest", "ebay", "placeholder", "logo", "openfoodfacts", 
                             "icon", "thumb", "avatar", "sprite", "vector",
                             "s192", "width=250", "160x160", "200x200", "250x250", "300x300"
                         ]
-                        
-                        # 2. Block Amazon UI composites (URLs with commas or dynamic crop modifiers)
                         is_bad_amazon = "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower)
                         
                         if url not in img_urls and not any(bad in url_lower for bad in bad_patterns) and not is_bad_amazon:
@@ -146,7 +177,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     return product_name, img_urls, "\n".join(diagnostic_log)
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
-def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
+def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list):
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET PRODUCT: {product_name} (EAN: {ean})
@@ -158,7 +189,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     3. LANGUAGE: All output text MUST be in English for standardization, except the "Item Description" which should match the native market language.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
-    6. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
+    6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
+    7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
 
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
@@ -168,14 +200,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
     - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
     - To avoid RECITATION errors, do NOT copy-paste long paragraphs of text verbatim.
-    - You are ALLOWED to write a brief summary of your search findings BEFORE the JSON block to help organize your thoughts.
-    - However, your final output MUST contain the JSON object.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
     - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
     
     SCHEMA:
     {{
+        "chain_of_thought": "Step-by-step reasoning of how you found the data, translated it, and read the images to ensure accuracy.",
         "item_description": "Native language product name/description",
         "category_1": "Level 1 Category",
         "category_2": "Level 2 Category",
@@ -213,12 +244,20 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
     """
     
     client = genai.Client(api_key=gemini_key)
+    
+    # Build Multi-Modal Content Payload
+    contents_payload = [prompt]
+    for img in image_bytes_list:
+        contents_payload.append(
+            types.Part.from_bytes(data=img["data"], mime_type=img["mime"])
+        )
+
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=prompt,
+            contents=contents_payload,
             config=types.GenerateContentConfig(
-                temperature=0.0,
+                temperature=0.25,
                 tools=[{"google_search": {}}],
                 max_output_tokens=8192,
                 safety_settings=[
@@ -243,19 +282,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
         )
         
         if not response.candidates:
-            # Better diagnostics for completely blocked requests
             raw_resp_str = str(response)[:500].replace('\n', ' ')
             return {"error": f"API Error: Request blocked entirely. Raw response: {raw_resp_str}"}
             
         raw_text = ""
         try:
-            # Safely iterate through parts because response.text can be None if the model outputs thoughts but no text
             if response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
                     if getattr(part, 'text', None):
                         raw_text += part.text + "\n"
             
-            # Fallback to response.text if parts iteration didn't catch it
             if not raw_text.strip() and getattr(response, 'text', None):
                 raw_text = response.text
                 
@@ -269,7 +305,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
                 return {"error": f"API Error: Empty text extracted. Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
                 
         except Exception as e:
-            # Handles any other unexpected exceptions when fetching text
             finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
             return {"error": f"API Error: Could not extract text parts ({str(e)}). System Finish Reason: {finish_reason}"}
         
@@ -286,21 +321,18 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text):
 
         unique_urls = list(dict.fromkeys(working_urls))
         
-        # Bulletproof JSON extraction: Find the first '{' and last '}'
         start_idx = raw_text.find('{')
         end_idx = raw_text.rfind('}')
         
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
             clean_json = raw_text[start_idx:end_idx+1]
         else:
-            # Capture the start of the rogue text to see what it said instead of JSON
             rogue_preview = raw_text[:200].replace('\n', ' ')
             return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
         
         try:
             data = json.loads(clean_json, strict=False)
             
-            # Keep sources as a list for individual columns
             if unique_urls:
                 data["sources"] = unique_urls
             elif isinstance(data.get("sources"), str):
@@ -321,16 +353,21 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
     async with sem:
         name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         
-        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text)
+        # Download images for Gemini Vision (Max 2 to save payload size)
+        downloaded_images = []
+        for url in img_urls[:2]:
+            img_data = await fetch_image_bytes(session, url)
+            if img_data:
+                downloaded_images.append(img_data)
+        
+        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, downloaded_images)
         
         if "error" in data:
-            # Format diagnostic log nicely if it errored out
             clean_log = diag_info.replace('\n', ' | ')
             return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
         imgs = img_urls + ["", "", ""]
         
-        # Safely pad the sources list so we always have at least 5 elements for the columns
         sources = data.get("sources", [])
         if isinstance(sources, str):
             sources = [s.strip() for s in sources.split(",") if s.strip()]
@@ -344,6 +381,7 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "GTIN / EAN": ean,
             "Product Name": name,
             "Item Description": data.get("item_description", name),
+            "Chain of Thought": data.get("chain_of_thought", ""),
             "Category L1": data.get("category_1", ""),
             "Category L2": data.get("category_2", ""),
             "Category L3": data.get("category_3", ""),
