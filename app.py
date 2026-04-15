@@ -5,6 +5,7 @@ import json
 import asyncio
 import aiohttp
 import re
+import time
 from google import genai
 from google.genai import types
 
@@ -27,6 +28,32 @@ GOLDMINE = {
     "PL": "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl",
 }
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
+
+BAD_IMAGE_EXTENSIONS = {".svg", ".gif", ".ico", ".webmanifest", ".json", ".xml"}
+BAD_IMAGE_PATTERNS = [
+    "logo", "icon", "banner", "placeholder", "spinner", "loading",
+    "payment", "paypal", "mastercard", "visa", "flag", "star",
+    "cart", "account", "arrow", "check", "tick", "social",
+    "openfoodfacts", "pinterest", "ebay", "tiktok", "facebook",
+    "instagram", "twitter", "youtube", "amazon-ads", "ad_",
+    "s192", "width=250", "160x160", "200x200", "250x250", "300x300",
+    "50x50", "75x30", "100x100", "128x128", "150x150", "_xs", "_xxs", "thumbnail"
+]
+
+def _is_valid_image_url(url: str) -> bool:
+    if not url or not url.startswith("http"): 
+        return False
+    url_lower = url.lower()
+    path = url_lower.split("?")[0]
+    
+    if any(path.endswith(ext) for ext in BAD_IMAGE_EXTENSIONS): return False
+    if any(p in url_lower for p in BAD_IMAGE_PATTERNS): return False
+    
+    # Block Amazon UI composites (URLs with commas or dynamic crop modifiers)
+    is_bad_amazon = "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower)
+    if is_bad_amazon: return False
+    
+    return True
 
 @st.cache_data
 def load_taxonomy():
@@ -54,27 +81,31 @@ async def fetch_og_image(session, url):
     return None
 
 async def fetch_image_bytes(session, url):
-    """Downloads image bytes to pass to Gemini Vision."""
+    """Downloads image bytes to pass to Gemini Vision and checks size/validity."""
     try:
-        async with session.get(url, timeout=5) as resp:
+        async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
-                mime = resp.headers.get("content-type", "image/jpeg")
                 data = await resp.read()
-                return {"mime": mime, "data": data}
+                # Reject if too small (icon/placeholder slipped through)
+                if len(data) < 8000:
+                    return None
+                mime = resp.headers.get("content-type", "image/jpeg")
+                return {"url": url, "mime": mime, "data": data}
     except Exception:
         pass
     return None
 
-# --- 1. BASIC INFO RETRIEVAL (Cascading Logic for Images) ---
+# --- 1. BASIC INFO RETRIEVAL (Robust Image Deduping) ---
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
-    """Uses cascading logic to find the exact product name and up to 3 images."""
+    """Retrieves exact product name and performs deduplicated, size-verified image gathering."""
     gl = market_code.lower()
     market_upper = market_code.upper()
     diagnostic_log = []
     
     product_name = None
-    img_urls = []
     retailer_urls = []
+    candidate_image_urls = []
+    registry_image_url = None
 
     # ATTEMPT 1: EAN-Search API (Exact Database Match)
     if ean_token:
@@ -86,8 +117,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                     data = await resp.json()
                     if data and len(data) > 0 and "error" not in data[0]:
                         product_name = data[0].get("name")
-                        if data[0].get("image"):
-                            img_urls.append(data[0].get("image"))
+                        registry_image_url = data[0].get("image")
                         diagnostic_log.append(f"✅ Found Name via EAN-Search: {product_name}")
         except Exception as e:
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
@@ -124,57 +154,64 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
         product_name = f"Product with EAN {ean}"
 
-    # ATTEMPT 3: Scrape High-Quality Images directly from Retailer URLs
-    if retailer_urls and len(img_urls) < 3:
-        diagnostic_log.append("🌐 Attempt 3: Extracting official images directly from Retailer URLs...")
+    # --- GATHERING CANDIDATE IMAGES ---
+    
+    # 1. Scrape High-Quality Images directly from Retailer URLs
+    if retailer_urls:
+        diagnostic_log.append("🌐 Scraping OG images directly from Retailers...")
         tasks = [fetch_og_image(session, url) for url in retailer_urls]
         og_images = await asyncio.gather(*tasks)
-        
         for img in og_images:
-            if img and img not in img_urls:
-                url_lower = img.lower()
-                bad_patterns = ["placeholder", "logo", "icon", "thumb", "avatar", "svg"]
-                if not any(bad in url_lower for bad in bad_patterns):
-                    img_urls.append(img)
-            if len(img_urls) >= 3:
-                break
+            if img and _is_valid_image_url(img) and img not in candidate_image_urls:
+                candidate_image_urls.append(img)
 
-    # ATTEMPT 4: Fallback to SerpAPI Google Images Search
-    if serp_key and len(img_urls) < 3:
-        diagnostic_log.append("🖼️ Attempt 4: Fallback to Google Images search...")
+    # 2. SerpAPI Parallel Image Search (Strict EAN & Barcode Lookups)
+    if serp_key:
+        diagnostic_log.append("🖼️ Searching high-res images via Google Images...")
         serp_url = "https://serpapi.com/search"
-        queries = [f'"{ean}"']
-        
-        for query in queries:
-            if len(img_urls) >= 3:
-                break
-                
-            img_params = {"q": query, "tbm": "isch", "gl": gl, "api_key": serp_key}
-            try:
-                async with session.get(serp_url, params=img_params, timeout=10) as img_resp:
-                    img_data = await img_resp.json()
-                    for image_res in img_data.get("images_results", []):
-                        url = image_res.get("original", "")
-                        
-                        # --- ADVANCED IMAGE QUALITY FILTER ---
-                        url_lower = url.lower()
-                        bad_patterns = [
-                            "pinterest", "ebay", "placeholder", "logo", "openfoodfacts", 
-                            "icon", "thumb", "avatar", "sprite", "vector",
-                            "s192", "width=250", "160x160", "200x200", "250x250", "300x300"
-                        ]
-                        is_bad_amazon = "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower)
-                        
-                        if url not in img_urls and not any(bad in url_lower for bad in bad_patterns) and not is_bad_amazon:
-                            img_urls.append(url)
-                            
-                        if len(img_urls) >= 3:
-                            break
-            except Exception:
-                pass
+        try:
+            r1, r2 = await asyncio.gather(
+                session.get(serp_url, params={"q": f'"{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
+                session.get(serp_url, params={"q": f'site:barcodelookup.com OR site:go-upc.com "{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
+                return_exceptions=True
+            )
+            for resp in [r1, r2]:
+                if not isinstance(resp, Exception) and resp.status == 200:
+                    img_data = await resp.json()
+                    for item in img_data.get("images_results", []):
+                        url = item.get("original", "")
+                        if _is_valid_image_url(url) and url not in candidate_image_urls:
+                            candidate_image_urls.append(url)
+        except Exception as e:
+            pass
 
-    diagnostic_log.append(f"✅ Secured {len(img_urls)} image(s).")
-    return product_name, img_urls, "\n".join(diagnostic_log)
+    # 3. Add Registry Image as final fallback
+    if registry_image_url and _is_valid_image_url(registry_image_url) and registry_image_url not in candidate_image_urls:
+        candidate_image_urls.append(registry_image_url)
+
+    # --- DOWNLOADING, SIZING, AND DEDUPLICATING IMAGES ---
+    final_downloaded_images = []
+    seen_b64_prefixes = []
+
+    for url in candidate_image_urls:
+        if len(final_downloaded_images) >= 2:  # Target exactly 2 images
+            break
+            
+        img_payload = await fetch_image_bytes(session, url)
+        if not img_payload:
+            continue
+            
+        # Deduplication: Check the first 120 bytes to ensure we don't grab identical product angles
+        prefix = img_payload["data"][:120]
+        if prefix in seen_b64_prefixes:
+            continue
+            
+        seen_b64_prefixes.append(prefix)
+        final_downloaded_images.append(img_payload)
+
+    diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} distinct, high-res image(s).")
+    return product_name, final_downloaded_images, "\n".join(diagnostic_log)
+
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list):
@@ -189,7 +226,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     CORE DIRECTIVES: 
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Item Description, Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories (category_1 to 6) MUST remain exactly as they appear in the English CSV.
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories (category_1 to 6) MUST remain exactly as they appear in the English CSV.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
@@ -201,9 +238,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     --- END TAXONOMY REFERENCE ---
     
     CRITICAL JSON RULES:
-    - YOU MUST ALWAYS RETURN A COMPLETE JSON OBJECT. NEVER return an empty string or refuse to answer.
+    - YOUR ENTIRE RESPONSE MUST BE A SINGLE VALID JSON OBJECT. NO EXCEPTIONS.
+    - NEVER write conversational text outside the JSON object. All thoughts, summaries, and reasoning MUST go inside the "chain_of_thought" field.
     - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
-    - To avoid RECITATION errors, do NOT copy-paste long paragraphs of text verbatim.
+    - To avoid RECITATION errors (copyright filters), do NOT copy-paste long paragraphs of text verbatim. You MUST paraphrase and summarize descriptions in your own words.
     - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
     - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
     - Do not use literal newlines/tabs inside strings.
@@ -213,7 +251,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "chain_of_thought": "Step-by-step reasoning of how you found the data, translated it, and read the images to ensure accuracy.",
         "food_info_reliability": "H, M, or L",
         "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
-        "item_description": "Native language product name/description (Translated to {market_code} market language)",
         "category_1": "Level 1 Category (English)",
         "category_2": "Level 2 Category (English)",
         "category_3": "Level 3 Category (English)",
@@ -258,41 +295,43 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
             types.Part.from_bytes(data=img["data"], mime_type=img["mime"])
         )
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=contents_payload,
-            config=types.GenerateContentConfig(
-                temperature=0.25,
-                tools=[{"google_search": {}}],
-                max_output_tokens=8192,
-                safety_settings=[
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                    )
-                ]
-            )
-        )
-        
-        if not response.candidates:
-            raw_resp_str = str(response)[:500].replace('\n', ' ')
-            return {"error": f"API Error: Request blocked entirely. Raw response: {raw_resp_str}"}
-            
-        raw_text = ""
+    last_error = "Unknown error"
+    
+    for attempt in range(3):
         try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=contents_payload,
+                config=types.GenerateContentConfig(
+                    temperature=0.25,
+                    tools=[{"google_search": {}}],
+                    max_output_tokens=8192,
+                    safety_settings=[
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+                        )
+                    ]
+                )
+            )
+            
+            if not response.candidates:
+                raw_resp_str = str(response)[:500].replace('\n', ' ')
+                raise Exception(f"Request blocked entirely. Raw response: {raw_resp_str}")
+                
+            raw_text = ""
             if response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
                     if getattr(part, 'text', None):
@@ -301,42 +340,35 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
             if not raw_text.strip() and getattr(response, 'text', None):
                 raw_text = response.text
                 
-            raw_text = raw_text.strip()
+            raw_text = raw_text.strip() if raw_text else ""
             
             if not raw_text:
                 candidate = response.candidates[0]
                 finish_reason = candidate.finish_reason
-                safety_data = str(candidate.safety_ratings).replace('\n', ' ')
-                usage_data = str(getattr(response, 'usage_metadata', 'No Usage Data')).replace('\n', ' ')
-                return {"error": f"API Error: Empty text extracted. Reason: {finish_reason} | Safety: {safety_data} | Usage: {usage_data}"}
-                
-        except Exception as e:
-            finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
-            return {"error": f"API Error: Could not extract text parts ({str(e)}). System Finish Reason: {finish_reason}"}
-        
-        working_urls = []
-        try:
-            if response.candidates and response.candidates[0].grounding_metadata:
-                metadata = response.candidates[0].grounding_metadata
-                if metadata.grounding_chunks:
-                    for chunk in metadata.grounding_chunks:
-                        if chunk.web and chunk.web.uri:
-                            working_urls.append(chunk.web.uri)
-        except Exception: 
-            pass
+                raise Exception(f"Empty text extracted. Reason: {finish_reason}")
+            
+            working_urls = []
+            try:
+                if response.candidates and response.candidates[0].grounding_metadata:
+                    metadata = response.candidates[0].grounding_metadata
+                    if metadata.grounding_chunks:
+                        for chunk in metadata.grounding_chunks:
+                            if chunk.web and chunk.web.uri:
+                                working_urls.append(chunk.web.uri)
+            except Exception: 
+                pass
 
-        unique_urls = list(dict.fromkeys(working_urls))
-        
-        start_idx = raw_text.find('{')
-        end_idx = raw_text.rfind('}')
-        
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            clean_json = raw_text[start_idx:end_idx+1]
-        else:
-            rogue_preview = raw_text[:200].replace('\n', ' ')
-            return {"error": f"JSON Error: Could not find JSON object. AI wrote: {rogue_preview}..."}
-        
-        try:
+            unique_urls = list(dict.fromkeys(working_urls))
+            
+            start_idx = raw_text.find('{')
+            end_idx = raw_text.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                clean_json = raw_text[start_idx:end_idx+1]
+            else:
+                rogue_preview = raw_text[:200].replace('\n', ' ')
+                raise Exception(f"Could not find JSON object. AI wrote: {rogue_preview}...")
+            
             data = json.loads(clean_json, strict=False)
             
             if unique_urls:
@@ -349,22 +381,20 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
             return data
             
         except json.JSONDecodeError as e:
-            return {"error": f"JSON Error: {str(e)}"}
+            last_error = f"JSON Error: {str(e)}"
+        except Exception as e:
+            last_error = str(e)
             
-    except Exception as e:
-        return {"error": f"API Error: {str(e)}"}
+        if attempt < 2:
+            time.sleep(3)
+
+    return {"error": f"API Error (Failed after 3 attempts). Last error: {last_error}"}
 
 # --- 3. ASYNC PIPELINE ---
 async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text):
     async with sem:
-        name, img_urls, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
-        
-        # Download images for Gemini Vision (Max 2 to save payload size)
-        downloaded_images = []
-        for url in img_urls[:2]:
-            img_data = await fetch_image_bytes(session, url)
-            if img_data:
-                downloaded_images.append(img_data)
+        # fetch_basic_info now returns the fully downloaded, deduplicated image payloads directly
+        name, downloaded_images, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         
         data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, downloaded_images)
         
@@ -372,7 +402,9 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             clean_log = diag_info.replace('\n', ' | ')
             return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
-        imgs = img_urls + ["", "", ""]
+        # Format image URLs for the DataFrame
+        img_urls = [img["url"] for img in downloaded_images]
+        imgs = img_urls + ["", ""]
         
         sources = data.get("sources", [])
         if isinstance(sources, str):
@@ -382,11 +414,9 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
-            "Image 3": imgs[2],
             "Status": "Success",
             "GTIN / EAN": ean,
             "Product Name": name,
-            "Item Description": data.get("item_description", name),
             "Info Reliability": data.get("food_info_reliability", ""),
             "Reliability Reasoning": data.get("reliability_reasoning", ""),
             "Chain of Thought": data.get("chain_of_thought", ""),
@@ -499,7 +529,6 @@ if st.button("🚀 Start Deep Research", type="primary"):
                 column_config={
                     "Image 1": st.column_config.ImageColumn(),
                     "Image 2": st.column_config.ImageColumn(),
-                    "Image 3": st.column_config.ImageColumn(),
                     "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
                     "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
                     "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
