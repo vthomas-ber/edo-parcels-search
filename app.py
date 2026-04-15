@@ -226,12 +226,16 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     CORE DIRECTIVES: 
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories (category_1 to 6) MUST remain exactly as they appear in the English CSV.
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
     8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site. Explain your choice in the reliability_reasoning field.
+    9. TAGGING: Assign applicable tags from the exact lists below based on all gathered info (ingredients, image, description). Output them as comma-separated strings in English.
+       - DIETARY TAGS: Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High protein, Gluten-free, Low Fat.
+       - OCCASION TAGS: Breakfast, Lunchbox, BBQ, Party, Christmas, Ramadan, Meal prep, Quick dinner, Kids snack.
+       - SEASONAL TAGS: Christmas, Easter, Back to School, Valentines Day, Mothers Day, Halloween, Other.
 
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
@@ -258,6 +262,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "category_5": "Level 5 Category (English)",
         "category_6": "Level 6 Variant or None (English)",
         "categorization_reasoning": "Brief explanation of why these categories were chosen",
+        "dietary_tags": "Comma-separated tags from the exact Dietary list (English)",
+        "occasion_tags": "Comma-separated tags from the exact Occasion list (English)",
+        "seasonal_tags": "Comma-separated tags from the exact Seasonal list (English)",
+        "tagging_reasoning": "Explanation for the chosen Dietary, Occasion, and Seasonal tags",
         "brand": "Brand Name",
         "uom": "Strictly write 'g' (or 'ml' for liquids). Do not write 'gram', 'grams', 'gr'.",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
@@ -265,7 +273,6 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "net_weight": "Weight/Volume number only",
         "gross_weight": "Gross weight if found, else null",
         "organic_product": "Yes or No",
-        "dietary": "Vegetarian, Vegan, Halal, Kosher, Gluten-free, etc. (Translated to {market_code} language)",
         "net_weight_customer_facing": "How weight is displayed on pack",
         "ingredients": "Full list as a single string (Translated to {market_code} language)",
         "allergens": "List as a single string (Translated to {market_code} language)",
@@ -427,6 +434,10 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Category L5": data.get("category_5", ""),
             "Category L6": data.get("category_6", ""),
             "Categorization Diagnosis": data.get("categorization_reasoning", ""),
+            "Dietary Tags": data.get("dietary_tags", ""),
+            "Occasion Tags": data.get("occasion_tags", ""),
+            "Seasonal Tags": data.get("seasonal_tags", ""),
+            "Tagging Reasoning": data.get("tagging_reasoning", ""),
             "Brand": data.get("brand", ""),
             "UoM": data.get("uom", ""),
             "Packaging": data.get("packaging", ""),
@@ -434,7 +445,6 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             "Net Weight (g) / Volume": data.get("net_weight", ""),
             "Gross Weight (g)": data.get("gross_weight", ""),
             "Organic Product": data.get("organic_product", ""),
-            "Dietary": data.get("dietary", ""),
             "Net Weight/ Volume (Customer Facing)": data.get("net_weight_customer_facing", ""),
             "Ingredients": data.get("ingredients", ""),
             "Allergens": data.get("allergens", ""),
