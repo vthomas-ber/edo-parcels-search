@@ -214,20 +214,23 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
 
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
-def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list):
+def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list, user_ground_truth):
     market_upper = market_code.upper()
     goldmine_sites = GOLDMINE.get(market_upper, "Major Tier-1 Supermarkets")
     
     prompt = f"""
     You are the Lead Food Product Researcher.
-    TARGET PRODUCT: {product_name} (EAN: {ean})
+    TARGET EAN: {ean}
+    ONLINE PRODUCT NAME FOUND: {product_name}
+    USER INPUT (GROUND TRUTH): {user_ground_truth if user_ground_truth else "None provided (Proceed normally)"}
     MARKET: {market_code}
     
     CORE DIRECTIVES: 
+    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it is empty, proceed normally. If it contains text (like a brand, name, or weight), compare it to the product data you found online for this EAN. They MUST be the exact same product. If the brand, weight, or specific flavor is clearly different (e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g'), you MUST set "is_exact_match" to false and return "null" for all other extraction fields. If it matches, or if no user info was provided, set "is_exact_match" to true and extract the data.
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
-    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null".
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
+    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
@@ -252,7 +255,8 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     
     SCHEMA:
     {{
-        "chain_of_thought": "Step-by-step reasoning of how you found the data, translated it, and read the images to ensure accuracy.",
+        "is_exact_match": true or false,
+        "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images.",
         "food_info_reliability": "H, M, or L",
         "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
         "category_1": "Level 1 Category (English)",
@@ -265,7 +269,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "dietary_tags": "Comma-separated tags from the exact Dietary list (English)",
         "occasion_tags": "Comma-separated tags from the exact Occasion list (English)",
         "seasonal_tags": "Comma-separated tags from the exact Seasonal list (English)",
-        "tagging_reasoning": "Explanation for the chosen Dietary, Occasion, and Seasonal tags",
+        "tagging_reasoning": "Brief explanation for the chosen tags. Be concise. Only explain assigned tags, do not explain rejected ones.",
         "brand": "Brand Name",
         "uom": "Strictly write 'g' (or 'ml' for liquids). Do not write 'gram', 'grams', 'gr'.",
         "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
@@ -398,18 +402,19 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     return {"error": f"API Error (Failed after 3 attempts). Last error: {last_error}"}
 
 # --- 3. ASYNC PIPELINE ---
-async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text):
+async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, market, taxonomy_text):
+    ean = ean_dict["ean"]
+    ground_truth = ean_dict["ground_truth"]
+    
     async with sem:
-        # fetch_basic_info now returns the fully downloaded, deduplicated image payloads directly
         name, downloaded_images, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         
-        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, downloaded_images)
+        data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, downloaded_images, ground_truth)
         
         if "error" in data:
             clean_log = diag_info.replace('\n', ' | ')
-            return {"row": {"GTIN / EAN": ean, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
+            return {"row": {"GTIN / EAN": ean, "User Input": ground_truth, "Status": f"{data['error']} (Diag: {clean_log})"}, "diag": diag_info}
 
-        # Format image URLs for the DataFrame
         img_urls = [img["url"] for img in downloaded_images]
         imgs = img_urls + ["", ""]
         
@@ -418,11 +423,37 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
             sources = [s.strip() for s in sources.split(",") if s.strip()]
         srcs = (sources + ["", "", "", "", ""])[:5]
 
+        # Check the Validation Gate
+        if data.get("is_exact_match") is False:
+            row = {
+                "Image 1": imgs[0],
+                "Image 2": imgs[1],
+                "Status": "Failed Validation",
+                "GTIN / EAN": ean,
+                "User Input": ground_truth,
+                "Product Name": name,
+                "Categorization Diagnosis": "Error: EAN does not correspond to the product found.",
+                "Info Reliability": "",
+                "Reliability Reasoning": data.get("chain_of_thought", ""),
+                "Chain of Thought": data.get("chain_of_thought", ""),
+                "Category L1": "", "Category L2": "", "Category L3": "", "Category L4": "", "Category L5": "", "Category L6": "",
+                "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "", "Tagging Reasoning": "",
+                "Brand": "", "UoM": "", "Packaging": "", "Fragile Item": "", "Net Weight (g) / Volume": "", "Gross Weight (g)": "",
+                "Organic Product": "", "Net Weight/ Volume (Customer Facing)": "", "Ingredients": "", "Allergens": "", "May Contain": "",
+                "Nutritional Info": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
+                "Energy (kJ)": "", "Fat (g)": "", "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "", "Of Which Sugars (g)": "",
+                "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
+                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4]
+            }
+            return {"row": row, "diag": diag_info}
+
+        # Passed Validation, populate fully
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
             "Status": "Success",
             "GTIN / EAN": ean,
+            "User Input": ground_truth,
             "Product Name": name,
             "Info Reliability": data.get("food_info_reliability", ""),
             "Reliability Reasoning": data.get("reliability_reasoning", ""),
@@ -469,13 +500,13 @@ async def process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market
         }
         return {"row": row, "diag": diag_info}
 
-async def run_main(eans, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
+async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
     sem = asyncio.Semaphore(5) 
     async with aiohttp.ClientSession() as session:
-        tasks = [process_ean(sem, session, ean, serp_key, gemini_key, ean_token, market, taxonomy_text) for ean in eans]
+        tasks = [process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text) for item in parsed_inputs]
         
         results = []
-        total = len(eans)
+        total = len(parsed_inputs)
         completed = 0
         
         for f in asyncio.as_completed(tasks):
@@ -516,20 +547,43 @@ with st.sidebar:
     if "Error" in taxonomy_text:
         st.error("⚠️ taxonomy.csv missing from project root! Categorization will fail.")
 
-ean_input = st.text_area("Insert EANs (one per line):")
+st.markdown("""
+**Input Instructions:** Paste rows directly from Excel or type them manually. 
+The system will automatically find the EAN (8-14 digits) anywhere in the line. Any other text on that line (Brand, Name, Weight) will be used by the AI to strictly validate if it found the correct product online.
+""")
+
+ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
 
 if st.button("🚀 Start Deep Research", type="primary"):
     if not SERP_KEY or not GEMINI_KEY:
         st.error("API Keys are missing from your environment variables! Please set SERPAPI_KEY and GEMINI_API_KEY.")
         st.stop()
         
-    eans = [e.strip() for e in ean_input.split("\n") if e.strip()]
-    if eans:
+    # Regex Parser to handle messy inputs from Excel (any order)
+    parsed_inputs = []
+    for line in ean_input.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Find the first sequence of 8 to 14 digits (EAN)
+        match = re.search(r'\b\d{8,14}\b', line)
+        if match:
+            ean = match.group(0)
+            # Remove the EAN from the line, the rest is the "User Ground Truth"
+            ground_truth = line.replace(ean, "").strip()
+            # Clean up extra spaces/tabs
+            ground_truth = re.sub(r'\s+', ' ', ground_truth)
+            parsed_inputs.append({"ean": ean, "ground_truth": ground_truth})
+        else:
+            st.warning(f"⚠️ Could not find a valid 8-14 digit EAN in line: '{line}' - Skipping.")
+
+    if parsed_inputs:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         
-        with st.spinner(f"Analyzing {len(eans)} products concurrently..."):
-            all_data = asyncio.run(run_main(eans, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, taxonomy_text, progress_bar, status_text))
+        with st.spinner(f"Analyzing {len(parsed_inputs)} products concurrently..."):
+            all_data = asyncio.run(run_main(parsed_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code, taxonomy_text, progress_bar, status_text))
             
             df = pd.DataFrame(all_data)
             
