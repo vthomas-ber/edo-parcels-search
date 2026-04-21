@@ -81,23 +81,43 @@ async def fetch_og_image(session, url):
     return None
 
 async def fetch_image_bytes(session, url):
-    """Downloads image bytes to pass to Gemini Vision and checks size/validity."""
+    """Downloads image bytes to pass to Gemini Vision and sanitizes MIME types."""
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.read()
-                # Reject if too small (icon/placeholder slipped through)
                 if len(data) < 8000:
                     return None
-                mime = resp.headers.get("content-type", "image/jpeg")
+                
+                # BUGFIX: Sanitize MIME type to prevent 400 INVALID_ARGUMENT crashes
+                raw_mime = resp.headers.get("content-type", "image/jpeg")
+                mime = raw_mime.split(";")[0].strip().lower()
+                if mime not in ["image/jpeg", "image/png", "image/webp", "image/heic"]:
+                    mime = "image/jpeg" # Safe fallback
+                    
                 return {"url": url, "mime": mime, "data": data}
     except Exception:
         pass
     return None
 
+async def trace_urls(session, urls):
+    """DIAGNOSTIC TOOL: Silently pings Google Grounding URLs to capture HTTP status and redirects."""
+    if not urls: return ""
+    traces = []
+    for url in urls:
+        try:
+            # allow_redirects=False captures the immediate hop/block
+            async with session.get(url, allow_redirects=False, timeout=5) as resp:
+                status = resp.status
+                loc = resp.headers.get('Location', 'No Redirect')
+                traces.append(f"[{status}] -> {loc}")
+        except Exception as e:
+            traces.append(f"[ERR: {type(e).__name__}]")
+    return " || ".join(traces)
+
 # --- 1. BASIC INFO RETRIEVAL (Robust Image Deduping) ---
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
-    """Retrieves exact product name and performs deduplicated, size-verified image gathering."""
+    """Retrieves exact product name, deduplicated images, and raw SerpAPI URLs for diagnosis."""
     gl = market_code.lower()
     market_upper = market_code.upper()
     diagnostic_log = []
@@ -107,7 +127,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     candidate_image_urls = []
     registry_image_url = None
 
-    # ATTEMPT 1: EAN-Search API (Exact Database Match)
     if ean_token:
         diagnostic_log.append("🔍 Attempt 1: EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
@@ -122,14 +141,12 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
 
-    # ATTEMPT 2: SerpAPI Text Search (Goldmine + Generic)
     if not product_name and serp_key:
         diagnostic_log.append("🔍 Attempt 2: Goldmine Google Search for Name...")
         serp_url = "https://serpapi.com/search"
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
         
         try:
-            # First try Goldmine specific search
             async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
                 organic = data.get("organic_results", [])
@@ -138,7 +155,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                     diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
                     retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
                 else:
-                    # Fallback to bare GTIN global search
                     diagnostic_log.append("⚠️ Goldmine failed, falling back to global bare GTIN search...")
                     async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
                         data2 = await resp2.json()
@@ -155,8 +171,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         product_name = f"Product with EAN {ean}"
 
     # --- GATHERING CANDIDATE IMAGES ---
-    
-    # 1. Scrape High-Quality Images directly from Retailer URLs
     if retailer_urls:
         diagnostic_log.append("🌐 Scraping OG images directly from Retailers...")
         tasks = [fetch_og_image(session, url) for url in retailer_urls]
@@ -165,7 +179,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
             if img and _is_valid_image_url(img) and img not in candidate_image_urls:
                 candidate_image_urls.append(img)
 
-    # 2. SerpAPI Parallel Image Search (Strict EAN & Barcode Lookups)
     if serp_key:
         diagnostic_log.append("🖼️ Searching high-res images via Google Images...")
         serp_url = "https://serpapi.com/search"
@@ -185,23 +198,20 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             pass
 
-    # 3. Add Registry Image as final fallback
     if registry_image_url and _is_valid_image_url(registry_image_url) and registry_image_url not in candidate_image_urls:
         candidate_image_urls.append(registry_image_url)
 
-    # --- DOWNLOADING, SIZING, AND DEDUPLICATING IMAGES ---
     final_downloaded_images = []
     seen_b64_prefixes = []
 
     for url in candidate_image_urls:
-        if len(final_downloaded_images) >= 2:  # Target exactly 2 images
+        if len(final_downloaded_images) >= 2:
             break
             
         img_payload = await fetch_image_bytes(session, url)
         if not img_payload:
             continue
             
-        # Deduplication: Check the first 120 bytes to ensure we don't grab identical product angles
         prefix = img_payload["data"][:120]
         if prefix in seen_b64_prefixes:
             continue
@@ -210,7 +220,9 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         final_downloaded_images.append(img_payload)
 
     diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} distinct, high-res image(s).")
-    return product_name, final_downloaded_images, "\n".join(diagnostic_log)
+    
+    # Return the raw retailer URLs for the collision log
+    return product_name, final_downloaded_images, "\n".join(diagnostic_log), retailer_urls
 
 
 # --- 2. GEMINI EXTRACTION (Robust JSON & Taxonomy Logic) ---
@@ -226,16 +238,22 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     MARKET: {market_code}
     
     CORE DIRECTIVES: 
-    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it is empty, proceed normally. If it contains text (like a brand, name, or weight), compare it to the product data you found online for this EAN. They MUST be the exact same product. If the brand, weight, or specific flavor is clearly different (e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g'), you MUST set "is_exact_match" to false and return "null" for all other extraction fields. If it matches, or if no user info was provided, set "is_exact_match" to true and extract the data.
+    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it contains text, compare it to the product data you found online for this EAN. Set "is_exact_match" to false ONLY if it is definitively a different product (e.g., 'Strawberry' vs 'Vanilla'). 
+       CRITICAL ALLOWANCES (DO NOT REJECT IF):
+       - The "ONLINE PRODUCT NAME FOUND" is a generic placeholder (e.g., "Product with EAN...").
+       - There are language translation differences (e.g., Czech name vs German name).
+       - There are regional brand variations of the exact same product.
+       - The User Input specifies a single-unit weight (e.g. 16g), but the online product is a multi-pack of that exact same item (e.g. 10x16g). Treat this as a match!
+       If it is a match (or an allowed variation), set "is_exact_match" to true and proceed.
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers. 
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
-    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
-    5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below.
+    4. MISSING DATA: Do not guess. If specific data is missing, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
+    5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None".
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
-    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site. Explain your choice in the reliability_reasoning field.
-    9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. For example, if a product is 'Vegan', you MUST also explicitly evaluate and assign 'Vegetarian' and 'Dairy Free' if they apply. Treat this as a mandatory True/False checklist for every single word in these lists to ensure maximum consistency across outputs.
+    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site.
+    9. EXHAUSTIVE TAGGING: You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Treat this as a mandatory True/False checklist.
        - DIETARY TAGS: Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High protein, Gluten-free, Low Fat.
        - OCCASION TAGS: Breakfast, Lunchbox, BBQ, Party, Christmas, Ramadan, Meal prep, Quick dinner, Kids snack.
        - SEASONAL TAGS: Christmas, Easter, Back to School, Valentines Day, Mothers Day, Halloween, Other.
@@ -246,42 +264,37 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     
     CRITICAL JSON RULES:
     - YOUR ENTIRE RESPONSE MUST BE A SINGLE VALID JSON OBJECT. NO EXCEPTIONS.
-    - NEVER write conversational text outside the JSON object. All thoughts, summaries, and reasoning MUST go inside the "chain_of_thought" field.
-    - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
-    - To avoid RECITATION errors (copyright filters), do NOT copy-paste long paragraphs of text verbatim. You MUST paraphrase and summarize descriptions in your own words.
-    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
-    - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
-    - Do not use literal newlines/tabs inside strings.
+    - NEVER write conversational text outside the JSON object.
     
     SCHEMA:
     {{
         "is_exact_match": true or false,
-        "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images.",
+        "chain_of_thought": "Step-by-step reasoning.",
         "food_info_reliability": "H, M, or L",
-        "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
-        "category_1": "Level 1 Category (English)",
-        "category_2": "Level 2 Category (English)",
-        "category_3": "Level 3 Category (English)",
-        "category_4": "Level 4 Category (English)",
-        "category_5": "Level 5 Category (English)",
-        "category_6": "Level 6 Variant or None (English)",
-        "categorization_reasoning": "Brief explanation of why these categories were chosen",
-        "dietary_tags": "Comma-separated tags from the exact Dietary list (English)",
-        "occasion_tags": "Comma-separated tags from the exact Occasion list (English)",
-        "seasonal_tags": "Comma-separated tags from the exact Seasonal list (English)",
-        "tagging_reasoning": "Brief explanation for the chosen tags. Be concise. Only explain assigned tags, do not explain rejected ones.",
+        "reliability_reasoning": "Explain why H, M, or L was assigned",
+        "category_1": "Level 1 Category",
+        "category_2": "Level 2 Category",
+        "category_3": "Level 3 Category",
+        "category_4": "Level 4 Category",
+        "category_5": "Level 5 Category",
+        "category_6": "Level 6 Variant or None",
+        "categorization_reasoning": "Brief explanation",
+        "dietary_tags": "Comma-separated tags",
+        "occasion_tags": "Comma-separated tags",
+        "seasonal_tags": "Comma-separated tags",
+        "tagging_reasoning": "Brief explanation for chosen tags.",
         "brand": "Brand Name",
-        "uom": "Strictly write 'g' (or 'ml' for liquids). Do not write 'gram', 'grams', 'gr'.",
-        "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
+        "uom": "Strictly write 'g' or 'ml'.",
+        "packaging": "Packaging type",
         "fragile_item": "Yes or No",
         "net_weight": "Weight/Volume number only",
         "gross_weight": "Gross weight if found, else null",
         "organic_product": "Yes or No",
         "net_weight_customer_facing": "How weight is displayed on pack",
-        "ingredients": "Full list as a single string (Translated to {market_code} language)",
-        "allergens": "List as a single string (Translated to {market_code} language)",
-        "may_contain": "List as a single string (Translated to {market_code} language)",
-        "nutritional_info": "Context (e.g., per 100g or per serving) (Translated to {market_code} language)",
+        "ingredients": "Full list as a single string",
+        "allergens": "List as a single string",
+        "may_contain": "List as a single string",
+        "nutritional_info": "Context (e.g., per 100g)",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
         "organic_certification_id": "e.g., DE-ÖKO-001 or null",
@@ -299,12 +312,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     
     client = genai.Client(api_key=gemini_key)
     
-    # Build Multi-Modal Content Payload
     contents_payload = [prompt]
     for img in image_bytes_list:
-        contents_payload.append(
-            types.Part.from_bytes(data=img["data"], mime_type=img["mime"])
-        )
+        contents_payload.append(types.Part.from_bytes(data=img["data"], mime_type=img["mime"]))
 
     last_error = "Unknown error"
     
@@ -316,49 +326,27 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
                 config=types.GenerateContentConfig(
                     temperature=0.25,
                     tools=[{"google_search": {}}],
-                    max_output_tokens=8192,
-                    safety_settings=[
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        )
-                    ]
+                    max_output_tokens=8192
                 )
             )
             
             if not response.candidates:
-                raw_resp_str = str(response)[:500].replace('\n', ' ')
-                raise Exception(f"Request blocked entirely. Raw response: {raw_resp_str}")
+                raise Exception("Request blocked entirely.")
                 
             raw_text = ""
             if response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
-                    if getattr(part, 'text', None):
-                        raw_text += part.text + "\n"
+                    if getattr(part, 'text', None): raw_text += part.text + "\n"
             
             if not raw_text.strip() and getattr(response, 'text', None):
                 raw_text = response.text
                 
             raw_text = raw_text.strip() if raw_text else ""
-            
-            if not raw_text:
-                candidate = response.candidates[0]
-                finish_reason = candidate.finish_reason
-                raise Exception(f"Empty text extracted. Reason: {finish_reason}")
+            if not raw_text: raise Exception("Empty text extracted.")
             
             working_urls = []
+            raw_metadata_dump = []
+            
             try:
                 if response.candidates and response.candidates[0].grounding_metadata:
                     metadata = response.candidates[0].grounding_metadata
@@ -366,8 +354,12 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
                         for chunk in metadata.grounding_chunks:
                             if chunk.web and chunk.web.uri:
                                 working_urls.append(chunk.web.uri)
-            except Exception: 
-                pass
+                                # DIAGNOSTIC: Capture the raw Google title and URL mapping
+                                raw_metadata_dump.append({
+                                    "title": getattr(chunk.web, 'title', 'No Title'),
+                                    "uri": chunk.web.uri
+                                })
+            except Exception: pass
 
             unique_urls = list(dict.fromkeys(working_urls))
             
@@ -377,17 +369,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
             if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
                 clean_json = raw_text[start_idx:end_idx+1]
             else:
-                rogue_preview = raw_text[:200].replace('\n', ' ')
-                raise Exception(f"Could not find JSON object. AI wrote: {rogue_preview}...")
+                raise Exception(f"Could not find JSON object. AI wrote: {raw_text[:200]}...")
             
             data = json.loads(clean_json, strict=False)
             
-            if unique_urls:
-                data["sources"] = unique_urls
-            elif isinstance(data.get("sources"), str):
-                data["sources"] = [s.strip() for s in data.get("sources").split(",") if s.strip()]
-            elif not isinstance(data.get("sources"), list):
-                data["sources"] = []
+            data["sources"] = unique_urls
+            # Insert the raw metadata dump into the data object for diagnostic extraction
+            data["raw_grounding_metadata"] = raw_metadata_dump
                 
             return data
             
@@ -407,7 +395,7 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
     ground_truth = ean_dict["ground_truth"]
     
     async with sem:
-        name, downloaded_images, diag_info = await fetch_basic_info(session, ean, serp_key, ean_token, market)
+        name, downloaded_images, diag_info, retailer_urls = await fetch_basic_info(session, ean, serp_key, ean_token, market)
         
         data = await asyncio.to_thread(run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, downloaded_images, ground_truth)
         
@@ -419,22 +407,16 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
         imgs = img_urls + ["", ""]
         
         sources = data.get("sources", [])
-        if isinstance(sources, str):
-            sources = [s.strip() for s in sources.split(",") if s.strip()]
         srcs = (sources + ["", "", "", "", ""])[:5]
+        
+        # DIAGNOSTIC: Ping the generated URLs to check for redirects/blocks
+        url_trace_log = await trace_urls(session, sources)
 
-        # Check the Validation Gate
         if data.get("is_exact_match") is False:
             row = {
-                "Image 1": imgs[0],
-                "Image 2": imgs[1],
-                "Status": "Failed Validation",
-                "GTIN / EAN": ean,
-                "User Input": ground_truth,
-                "Product Name": name,
+                "Image 1": imgs[0], "Image 2": imgs[1], "Status": "Failed Validation",
+                "GTIN / EAN": ean, "User Input": ground_truth, "Product Name": name,
                 "Categorization Diagnosis": "Error: EAN does not correspond to the product found.",
-                "Info Reliability": "",
-                "Reliability Reasoning": data.get("chain_of_thought", ""),
                 "Chain of Thought": data.get("chain_of_thought", ""),
                 "Category L1": "", "Category L2": "", "Category L3": "", "Category L4": "", "Category L5": "", "Category L6": "",
                 "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "", "Tagging Reasoning": "",
@@ -443,60 +425,39 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
                 "Nutritional Info": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
                 "Energy (kJ)": "", "Fat (g)": "", "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "", "Of Which Sugars (g)": "",
                 "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
-                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4]
+                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4],
+                "SerpAPI Found URLs": ", ".join(retailer_urls),
+                "Raw Grounding Dump": json.dumps(data.get("raw_grounding_metadata", [])),
+                "URL Trace Log": url_trace_log
             }
             return {"row": row, "diag": diag_info}
 
-        # Passed Validation, populate fully
         row = {
-            "Image 1": imgs[0],
-            "Image 2": imgs[1],
-            "Status": "Success",
-            "GTIN / EAN": ean,
-            "User Input": ground_truth,
-            "Product Name": name,
+            "Image 1": imgs[0], "Image 2": imgs[1], "Status": "Success",
+            "GTIN / EAN": ean, "User Input": ground_truth, "Product Name": name,
             "Info Reliability": data.get("food_info_reliability", ""),
             "Reliability Reasoning": data.get("reliability_reasoning", ""),
             "Chain of Thought": data.get("chain_of_thought", ""),
-            "Category L1": data.get("category_1", ""),
-            "Category L2": data.get("category_2", ""),
-            "Category L3": data.get("category_3", ""),
-            "Category L4": data.get("category_4", ""),
-            "Category L5": data.get("category_5", ""),
-            "Category L6": data.get("category_6", ""),
+            "Category L1": data.get("category_1", ""), "Category L2": data.get("category_2", ""),
+            "Category L3": data.get("category_3", ""), "Category L4": data.get("category_4", ""),
+            "Category L5": data.get("category_5", ""), "Category L6": data.get("category_6", ""),
             "Categorization Diagnosis": data.get("categorization_reasoning", ""),
-            "Dietary Tags": data.get("dietary_tags", ""),
-            "Occasion Tags": data.get("occasion_tags", ""),
-            "Seasonal Tags": data.get("seasonal_tags", ""),
-            "Tagging Reasoning": data.get("tagging_reasoning", ""),
-            "Brand": data.get("brand", ""),
-            "UoM": data.get("uom", ""),
-            "Packaging": data.get("packaging", ""),
-            "Fragile Item": data.get("fragile_item", ""),
-            "Net Weight (g) / Volume": data.get("net_weight", ""),
-            "Gross Weight (g)": data.get("gross_weight", ""),
-            "Organic Product": data.get("organic_product", ""),
-            "Net Weight/ Volume (Customer Facing)": data.get("net_weight_customer_facing", ""),
-            "Ingredients": data.get("ingredients", ""),
-            "Allergens": data.get("allergens", ""),
-            "May Contain": data.get("may_contain", ""),
-            "Nutritional Info": data.get("nutritional_info", ""),
-            "Manufacturer Address": data.get("manufacturer_address", ""),
-            "Place of Origin": data.get("place_of_origin", ""),
-            "Organic Certification ID": data.get("organic_certification_id", ""),
-            "Energy (kJ)": data.get("energy_kj", ""),
-            "Fat (g)": data.get("fat_g", ""),
-            "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
-            "Carbohydrates (g)": data.get("carbohydrates_g", ""),
-            "Of Which Sugars (g)": data.get("sugars_g", ""),
-            "Protein (g)": data.get("protein_g", ""),
-            "Fiber (g)": data.get("fiber_g", ""),
-            "Salt (g)": data.get("salt_g", ""),
-            "Source 1": srcs[0],
-            "Source 2": srcs[1],
-            "Source 3": srcs[2],
-            "Source 4": srcs[3],
-            "Source 5": srcs[4]
+            "Dietary Tags": data.get("dietary_tags", ""), "Occasion Tags": data.get("occasion_tags", ""),
+            "Seasonal Tags": data.get("seasonal_tags", ""), "Tagging Reasoning": data.get("tagging_reasoning", ""),
+            "Brand": data.get("brand", ""), "UoM": data.get("uom", ""),
+            "Packaging": data.get("packaging", ""), "Fragile Item": data.get("fragile_item", ""),
+            "Net Weight (g) / Volume": data.get("net_weight", ""), "Gross Weight (g)": data.get("gross_weight", ""),
+            "Organic Product": data.get("organic_product", ""), "Net Weight/ Volume (Customer Facing)": data.get("net_weight_customer_facing", ""),
+            "Ingredients": data.get("ingredients", ""), "Allergens": data.get("allergens", ""), "May Contain": data.get("may_contain", ""),
+            "Nutritional Info": data.get("nutritional_info", ""), "Manufacturer Address": data.get("manufacturer_address", ""),
+            "Place of Origin": data.get("place_of_origin", ""), "Organic Certification ID": data.get("organic_certification_id", ""),
+            "Energy (kJ)": data.get("energy_kj", ""), "Fat (g)": data.get("fat_g", ""), "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
+            "Carbohydrates (g)": data.get("carbohydrates_g", ""), "Of Which Sugars (g)": data.get("sugars_g", ""),
+            "Protein (g)": data.get("protein_g", ""), "Fiber (g)": data.get("fiber_g", ""), "Salt (g)": data.get("salt_g", ""),
+            "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4],
+            "SerpAPI Found URLs": ", ".join(retailer_urls),
+            "Raw Grounding Dump": json.dumps(data.get("raw_grounding_metadata", [])),
+            "URL Trace Log": url_trace_log
         }
         return {"row": row, "diag": diag_info}
 
@@ -559,20 +520,16 @@ if st.button("🚀 Start Deep Research", type="primary"):
         st.error("API Keys are missing from your environment variables! Please set SERPAPI_KEY and GEMINI_API_KEY.")
         st.stop()
         
-    # Regex Parser to handle messy inputs from Excel (any order)
     parsed_inputs = []
     for line in ean_input.split("\n"):
         line = line.strip()
         if not line:
             continue
             
-        # Find the first sequence of 8 to 14 digits (EAN)
         match = re.search(r'\b\d{8,14}\b', line)
         if match:
             ean = match.group(0)
-            # Remove the EAN from the line, the rest is the "User Ground Truth"
             ground_truth = line.replace(ean, "").strip()
-            # Clean up extra spaces/tabs
             ground_truth = re.sub(r'\s+', ' ', ground_truth)
             parsed_inputs.append({"ean": ean, "ground_truth": ground_truth})
         else:
