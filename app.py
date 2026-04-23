@@ -250,7 +250,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Do NOT use the origin country's language unless it matches the target market. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below.
     4. MISSING DATA: Do not guess. If specific data is missing, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None".
-    6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
+    6. MANDATORY WEB SEARCH & IMAGES: I have attached images of the product, but they usually only show the front packaging. You MUST actively use the Google Search tool to find the full ingredients, nutritional tables, and manufacturer details online. DO NOT rely solely on the images for food data. Citing web sources is strictly required for every product to ensure you provide links.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
     8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site.
     9. EXHAUSTIVE TAGGING: You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Treat this as a mandatory True/False checklist.
@@ -407,6 +407,13 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
         imgs = img_urls + ["", ""]
         
         sources = data.get("sources", [])
+        if isinstance(sources, str):
+            sources = [s.strip() for s in sources.split(",") if s.strip()]
+            
+        # GUARANTEE LINKS: If AI relied on images and left sources blank, fallback to SerpAPI links
+        if not sources and retailer_urls:
+            sources = retailer_urls
+            
         srcs = (sources + ["", "", "", "", ""])[:5]
         
         # DIAGNOSTIC: Ping the generated URLs to check for redirects/blocks
