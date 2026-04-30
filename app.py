@@ -45,9 +45,16 @@ BAD_IMAGE_PATTERNS = [
     "cart", "account", "arrow", "check", "tick", "social",
     "openfoodfacts", "pinterest", "ebay", "tiktok", "facebook",
     "instagram", "twitter", "youtube", "amazon-ads", "ad_",
-    "s192", "width=250", "160x160", "200x200", "250x250", "300x300",
-    "50x50", "75x30", "100x100", "128x128", "150x150", "_xs", "_xxs", "thumbnail"
+    "_xs", "_xxs", "thumbnail"
 ]
+
+# Tunable quality thresholds (loosened for better coverage)
+MIN_LONG_EDGE_PX = 250          # was 400 - many valid retailer images are 300-350px
+ASPECT_MIN = 0.3                # was 0.5 - allow tall bottles, narrow boxes
+ASPECT_MAX = 3.0                # was 2.0 - allow wide back-of-pack shots
+PHASH_DUPLICATE_THRESHOLD = 5   # was 12 - only drop near-identical images
+MAX_IMAGES_TO_GEMINI = 6        # send Gemini up to 6 images for extraction
+MAX_IMAGES_TO_DISPLAY = 2       # show user top 2 in results table
 
 # Image source priority (higher = better). Used when scoring candidates.
 SOURCE_PRIORITY = {
@@ -264,12 +271,13 @@ def inspect_image(data: bytes):
     """
     Real image inspection via PIL.
     Returns dict with width, height, long_edge, aspect, ok flag, and reason if not ok.
+    LOOSENED: 250px min, 0.3-3.0 aspect (was 400px, 0.5-2.0).
     """
     if not IMAGE_LIBS_OK:
         # Fallback: trust the byte length
         return {
             "width": None, "height": None, "long_edge": None, "aspect": None,
-            "ok": len(data) >= 8000,
+            "ok": len(data) >= 5000,
             "reason": "PIL not available - using byte length fallback"
         }
     try:
@@ -280,13 +288,12 @@ def inspect_image(data: bytes):
         aspect = w / h
         long_edge = max(w, h)
 
-        # A real product photo: at least 400px on long edge, aspect roughly square
-        if long_edge < 400:
+        if long_edge < MIN_LONG_EDGE_PX:
             return {"width": w, "height": h, "long_edge": long_edge, "aspect": aspect,
-                    "ok": False, "reason": f"Too small ({long_edge}px long edge, need 400+)"}
-        if aspect < 0.5 or aspect > 2.0:
+                    "ok": False, "reason": f"Too small ({long_edge}px long edge, need {MIN_LONG_EDGE_PX}+)"}
+        if aspect < ASPECT_MIN or aspect > ASPECT_MAX:
             return {"width": w, "height": h, "long_edge": long_edge, "aspect": aspect,
-                    "ok": False, "reason": f"Wrong aspect ratio ({aspect:.2f}, likely banner/strip)"}
+                    "ok": False, "reason": f"Wrong aspect ratio ({aspect:.2f}, outside {ASPECT_MIN}-{ASPECT_MAX})"}
 
         return {"width": w, "height": h, "long_edge": long_edge, "aspect": aspect,
                 "ok": True, "reason": ""}
@@ -352,90 +359,79 @@ async def evaluate_candidate(session, source, url, diag):
     }
 
 
-def select_best_two(candidates, diag):
+def select_images(candidates, diag):
     """
-    Pick image #1 (highest-scored) and image #2 (highest-scored AND visually different from #1).
-    Logs everything. Returns list of 0/1/2 candidate dicts.
+    NEW: returns TWO lists:
+      - extraction_set: up to MAX_IMAGES_TO_GEMINI viable images (deduped only on near-identical)
+                        sent to Gemini for nutrition/ingredient extraction.
+      - display_set: top MAX_IMAGES_TO_DISPLAY images by score for the results table.
+
+    Decoupling these means stricter display selection no longer starves Gemini of visual data.
     """
     if not candidates:
         diag.image_2_failure = "No candidate images survived quality checks."
-        return []
+        return [], []
 
-    # Score each: source priority + resolution bonus
+    # Score: source priority + resolution bonus
     def score(c):
         base = SOURCE_PRIORITY.get(c["source"], 30)
         long_edge = c["inspection"].get("long_edge") or 0
-        # Bonus: up to +20 for resolution (1500px+ caps out)
         res_bonus = min(20, long_edge / 75)
         return base + res_bonus
 
     sorted_cands = sorted(candidates, key=score, reverse=True)
 
-    # Pick #1: top scorer
-    pick1 = sorted_cands[0]
-    diag.log_candidate(
-        pick1["source"], pick1["url"], "selected",
-        f"Image #1 (score={score(pick1):.0f}, {pick1['inspection']['width']}x{pick1['inspection']['height']})",
-        width=pick1["inspection"]["width"], height=pick1["inspection"]["height"]
-    )
-    selected = [pick1]
-
-    # Pick #2: best remaining with phash distance >= 12 from pick #1
-    # (12+ = clearly different visual - back of pack, lifestyle shot, etc.)
-    pick2 = None
-    rejected_dups = 0
-    for c in sorted_cands[1:]:
-        dist = phash_distance(pick1["phash"], c["phash"])
-        if dist >= 12:
-            pick2 = c
-            diag.log_candidate(
-                c["source"], c["url"], "selected",
-                f"Image #2 (score={score(c):.0f}, phash_distance={dist} from #1)",
-                width=c["inspection"]["width"], height=c["inspection"]["height"]
-            )
-            selected.append(c)
-            break
-        else:
-            rejected_dups += 1
+    # --- Build extraction set: dedup only on NEAR-identical images (phash < 5) ---
+    extraction_set = []
+    extraction_hashes = []
+    for c in sorted_cands:
+        is_near_duplicate = any(
+            phash_distance(c["phash"], h) < PHASH_DUPLICATE_THRESHOLD
+            for h in extraction_hashes
+        )
+        if is_near_duplicate:
             diag.log_candidate(
                 c["source"], c["url"], "rejected_dedup",
-                f"Visual duplicate of Image #1 (phash_distance={dist})",
-                width=c["inspection"]["width"], height=c["inspection"]["height"]
+                f"Near-identical to already-included image (phash distance < {PHASH_DUPLICATE_THRESHOLD})",
+                width=c["inspection"].get("width"), height=c["inspection"].get("height")
             )
+            continue
+        extraction_set.append(c)
+        if c["phash"] is not None:
+            extraction_hashes.append(c["phash"])
+        if len(extraction_set) >= MAX_IMAGES_TO_GEMINI:
+            break
 
-    # If no pick #2 but there were OTHER candidates that we didn't consider strictly different,
-    # fall back to second-best by score even if visually similar - better than no image #2.
-    if pick2 is None and len(sorted_cands) > 1:
-        fallback = sorted_cands[1]
-        # Only use the fallback if we haven't already logged it as rejected_dedup above
-        already_logged = any(
-            c["full_url"] == fallback["url"] and c["status"] == "rejected_dedup"
-            for c in diag.candidates
+    # --- Build display set: top MAX_IMAGES_TO_DISPLAY by score from extraction set ---
+    display_set = extraction_set[:MAX_IMAGES_TO_DISPLAY]
+
+    # Log the chosen ones
+    for idx, c in enumerate(display_set):
+        diag.log_candidate(
+            c["source"], c["url"], "selected",
+            f"Display image #{idx+1} (score={score(c):.0f}, {c['inspection']['width']}x{c['inspection']['height']})",
+            width=c["inspection"]["width"], height=c["inspection"]["height"]
         )
-        if already_logged:
-            # Re-promote it
-            for c in diag.candidates:
-                if c["full_url"] == fallback["url"] and c["status"] == "rejected_dedup":
-                    c["status"] = "selected_fallback"
-                    c["reason"] = "Image #2 fallback (no visually distinct candidate available)"
-                    break
-        else:
-            diag.log_candidate(
-                fallback["source"], fallback["url"], "selected_fallback",
-                "Image #2 fallback (visually similar to #1, but only option)",
-                width=fallback["inspection"]["width"], height=fallback["inspection"]["height"]
-            )
-        selected.append(fallback)
-        pick2 = fallback
 
-    if pick2 is None:
-        if rejected_dups > 0:
-            diag.image_2_failure = f"All {rejected_dups} additional candidate(s) were visual duplicates of Image #1."
-        else:
-            diag.image_2_failure = "Only 1 candidate image passed quality checks."
+    # Log the extraction-only ones (sent to Gemini but not displayed)
+    for c in extraction_set[MAX_IMAGES_TO_DISPLAY:]:
+        diag.log_candidate(
+            c["source"], c["url"], "extraction_only",
+            f"Sent to Gemini for text extraction, not displayed (score={score(c):.0f})",
+            width=c["inspection"]["width"], height=c["inspection"]["height"]
+        )
 
-    diag.final_selected = [c["url"] for c in selected]
-    return selected
+    diag.final_selected = [c["url"] for c in display_set]
+
+    if len(display_set) < 2:
+        if len(extraction_set) == 1:
+            diag.image_2_failure = "Only 1 viable image found in entire pipeline."
+        elif len(candidates) > 1:
+            diag.image_2_failure = "Multiple candidates found but only 1 unique image (rest were near-duplicates)."
+        else:
+            diag.image_2_failure = "Only 1 candidate image survived quality checks."
+
+    return extraction_set, display_set
 
 
 # ============================================================================
@@ -573,17 +569,18 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
     diag.log(f"📊 {len(deduped)} unique candidate URLs collected. Evaluating...")
 
     # --- EVALUATE ALL CANDIDATES (download + PIL inspect + phash) ---
-    # Concurrent evaluation, cap at 12 to avoid wasted work
-    eval_tasks = [evaluate_candidate(session, src, url, diag) for src, url in deduped[:12]]
+    # Higher cap (16) to give us more raw material; we filter aggressively after
+    eval_tasks = [evaluate_candidate(session, src, url, diag) for src, url in deduped[:16]]
     eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
     valid_candidates = [r for r in eval_results if r and not isinstance(r, Exception)]
 
     diag.log(f"✅ {len(valid_candidates)} candidates passed download + quality inspection.")
 
-    # --- PICK BEST 2 with deliberate diversity ---
-    selected = select_best_two(valid_candidates, diag)
+    # --- SELECT: returns extraction set (for Gemini) + display set (for user) ---
+    extraction_set, display_set = select_images(valid_candidates, diag)
+    diag.log(f"🎯 Sending {len(extraction_set)} images to Gemini for extraction; displaying top {len(display_set)}.")
 
-    return product_name, selected, diag, ean_consistency
+    return product_name, extraction_set, display_set, diag, ean_consistency
 
 
 # ============================================================================
@@ -798,41 +795,36 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
 # 3. ASYNC PIPELINE (UPDATED)
 # ============================================================================
 
-def apply_image_verification(selected_images, gemini_data, diag):
+def apply_image_verification(display_images, gemini_data, diag):
     """
-    Post-process: drop images Gemini flagged as wrong product.
-    Returns updated list of image dicts (still in {url, mime, data, ...} form).
+    ADVISORY ONLY: log Gemini's verdicts on each image to diagnostics, but DO NOT
+    remove images. Previous behavior of dropping high-confidence rejections caused
+    coverage loss because Gemini sometimes mis-flags angled/lifestyle shots.
+    The human reviewer can use the diagnostics to decide.
     """
     verifications = gemini_data.get("image_verification", [])
     if not verifications or not isinstance(verifications, list):
-        return selected_images  # No verification data, keep all
+        return display_images  # No verification data, return as-is
 
-    verified = []
-    for idx, img in enumerate(selected_images):
+    for idx, img in enumerate(display_images):
         ver = next((v for v in verifications if v.get("image_index") == idx), None)
         if ver is None:
-            verified.append(img)  # No verdict, keep
             continue
 
         is_correct = ver.get("is_correct_product")
         confidence = ver.get("confidence", "")
         reasoning = ver.get("reasoning", "")
 
-        # Drop only on high-confidence rejection
-        if is_correct is False and confidence == "H":
-            diag.log_candidate(
-                img["source"], img["url"], "rejected_unverified",
-                f"Gemini Vision rejected (H confidence): {reasoning[:100]}",
-                width=img["inspection"].get("width"),
-                height=img["inspection"].get("height")
-            )
-            # Remove from final_selected list
-            if img["url"] in diag.final_selected:
-                diag.final_selected.remove(img["url"])
-        else:
-            verified.append(img)
+        # Log verdict to diagnostics, but never drop the image
+        if is_correct is False:
+            diag.log(f"⚠️ Gemini flagged image #{idx+1} as possibly wrong product "
+                     f"({confidence} confidence): {reasoning[:120]}")
+        elif is_correct is True:
+            diag.log(f"✅ Gemini confirmed image #{idx+1} as correct product "
+                     f"({confidence} confidence)")
 
-    return verified
+    # Always return all images - human reviews diagnostics if quality is suspect
+    return display_images
 
 
 async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, market, taxonomy_text):
@@ -840,13 +832,15 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
     ground_truth = ean_dict["ground_truth"]
 
     async with sem:
-        name, downloaded_images, diag, ean_consistency = await fetch_basic_info(
+        # NEW: fetch_basic_info now returns BOTH extraction_set (for Gemini) and display_set (for user)
+        name, extraction_images, display_images, diag, ean_consistency = await fetch_basic_info(
             session, ean, serp_key, ean_token, market
         )
 
+        # Send the FULL extraction set to Gemini (up to 6 images) for max visual data
         data = await asyncio.to_thread(
             run_gemini_sync, ean, name, market, gemini_key, taxonomy_text,
-            downloaded_images, ground_truth, ean_consistency
+            extraction_images, ground_truth, ean_consistency
         )
 
         if "error" in data:
@@ -859,16 +853,11 @@ async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, m
                 "diag": diag
             }
 
-        # Apply Gemini's image verification verdicts
-        verified_images = apply_image_verification(downloaded_images, data, diag)
-        img_urls = [img["url"] for img in verified_images]
+        # Apply Gemini's image verification (advisory only - logs to diag, never drops)
+        # Pass display_images so verdicts align with what the user actually sees
+        apply_image_verification(display_images, data, diag)
+        img_urls = [img["url"] for img in display_images]
         imgs = (img_urls + ["", ""])[:2]
-
-        # Update image_2_failure if verification dropped image #2
-        if len(verified_images) < 2 and not diag.image_2_failure:
-            diag.image_2_failure = "Image #2 was rejected by Gemini Vision verification."
-        elif len(verified_images) == 0:
-            diag.image_2_failure = "Both candidate images were rejected by Gemini Vision verification."
 
         sources = data.get("sources", [])
         if isinstance(sources, str):
@@ -1065,7 +1054,7 @@ if st.button("🚀 Start Deep Research", type="primary"):
                     "Source 4": st.column_config.LinkColumn(display_text="Link 4"),
                     "Source 5": st.column_config.LinkColumn(display_text="Link 5"),
                 },
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
 
@@ -1085,6 +1074,6 @@ if st.button("🚀 Start Deep Research", type="primary"):
                     if diag.candidates:
                         st.markdown("**Candidate images evaluated:**")
                         candidates_df = pd.DataFrame(diag.to_dict_list())
-                        st.dataframe(candidates_df, use_container_width=True, hide_index=True)
+                        st.dataframe(candidates_df, width='stretch', hide_index=True)
                     else:
                         st.info("No image candidates were collected.")
