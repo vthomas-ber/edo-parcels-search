@@ -3,3 +3,5 @@ pandas
 requests
 aiohttp
 google-genai
+Pillow
+imagehash
