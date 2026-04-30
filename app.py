@@ -39,14 +39,22 @@ GOLDMINE = {
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
 BAD_IMAGE_EXTENSIONS = {".svg", ".gif", ".ico", ".webmanifest", ".json", ".xml"}
-BAD_IMAGE_PATTERNS = [
+
+# Words that, when matched as a URL path SEGMENT or filename token, indicate non-product content.
+# Trimmed: removed cart/account/arrow/check/tick/star/flag - these appear in legitimate product CDN paths.
+# Now matched against URL segments (between / or _ or -), not raw substring, to avoid false positives.
+BAD_PATH_TOKENS = {
     "logo", "icon", "banner", "placeholder", "spinner", "loading",
-    "payment", "paypal", "mastercard", "visa", "flag", "star",
-    "cart", "account", "arrow", "check", "tick", "social",
-    "openfoodfacts", "pinterest", "ebay", "tiktok", "facebook",
-    "instagram", "twitter", "youtube", "amazon-ads", "ad_",
-    "_xs", "_xxs", "thumbnail"
-]
+    "payment", "paypal", "mastercard", "visa", "social",
+    "pinterest", "tiktok", "facebook", "instagram", "twitter", "youtube",
+    "thumbnail", "thumb", "avatar", "favicon", "sprite",
+}
+
+# These can appear ANYWHERE in URL (not segment-restricted) - true junk indicators
+BAD_SUBSTRINGS = {
+    "openfoodfacts", "amazon-ads", "ad_servlet", "doubleclick",
+    "_xs.", "_xxs.", "/icons/", "/logos/",
+}
 
 # Tunable quality thresholds (loosened for better coverage)
 MIN_LONG_EDGE_PX = 250          # was 400 - many valid retailer images are 300-350px
@@ -63,32 +71,83 @@ SOURCE_PRIORITY = {
     "twitter_retailer": 70,   # Twitter card on retailer page
     "serpapi_strict": 60,     # SerpAPI image search with quoted EAN
     "serpapi_barcode": 55,    # SerpAPI on barcode lookup sites
+    "serpapi_name": 50,       # SerpAPI image search by product name (NEW)
+    "serpapi_hailmary": 45,   # Generic Google image search, no quotes (NEW)
     "ean_search_registry": 40, # EAN-Search registry image
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-}
+# Multiple User-Agents to rotate on 403/429 responses
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+
+HEADERS = {"User-Agent": USER_AGENTS[0]}
+
+# EAN-Search placeholder/garbage detection - names that aren't real product names
+EAN_SEARCH_GARBAGE_PATTERNS = [
+    r"upc lookup",
+    r"ninguno",          # Spanish "none" - common placeholder
+    r"^lookup ",
+    r"barcode\s+\d",
+    r"unknown product",
+    r"^no\s+(name|product)",
+    r"^[\d\s#]+$",       # All digits/spaces/hashes
+    r"#####",            # Masked placeholder
+]
 
 
-def _is_valid_image_url(url: str) -> bool:
-    """First-pass URL filter: cheap rejection of obviously-bad URLs before download."""
+def is_garbage_name(name: str) -> bool:
+    """Detect EAN-Search placeholder responses that aren't real product names."""
+    if not name or len(name.strip()) < 3:
+        return True
+    name_lower = name.lower().strip()
+    for pattern in EAN_SEARCH_GARBAGE_PATTERNS:
+        if re.search(pattern, name_lower):
+            return True
+    return False
+
+
+def _check_url(url: str):
+    """
+    First-pass URL filter. Returns (is_valid, reason_if_rejected).
+    Now reports WHICH pattern matched so diagnostics are actionable.
+    """
     if not url or not url.startswith("http"):
-        return False
+        return False, "Not a valid http(s) URL"
+
     url_lower = url.lower()
     path = url_lower.split("?")[0]
 
-    if any(path.endswith(ext) for ext in BAD_IMAGE_EXTENSIONS):
-        return False
-    if any(p in url_lower for p in BAD_IMAGE_PATTERNS):
-        return False
+    # Bad extensions
+    for ext in BAD_IMAGE_EXTENSIONS:
+        if path.endswith(ext):
+            return False, f"Bad extension: {ext}"
 
-    # Block Amazon UI composites (URLs with commas or dynamic crop modifiers)
-    is_bad_amazon = "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower)
-    if is_bad_amazon:
-        return False
+    # Hard-banned substrings (true junk indicators)
+    for substr in BAD_SUBSTRINGS:
+        if substr in url_lower:
+            return False, f"Substring blacklist: '{substr}'"
 
-    return True
+    # Segment-based token check (avoids false positives from words like 'cart' inside CDN paths)
+    # Split path into tokens by /, _, -, .
+    tokens = set(re.split(r"[/_\-.]+", path))
+    for token in tokens:
+        if token in BAD_PATH_TOKENS:
+            return False, f"Path token blacklist: '{token}'"
+
+    # Block Amazon UI composites
+    if "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower):
+        return False, "Amazon UI composite (commas / _bo modifier)"
+
+    return True, ""
+
+
+def _is_valid_image_url(url: str) -> bool:
+    """Backwards-compat wrapper: returns just the boolean."""
+    ok, _ = _check_url(url)
+    return ok
 
 
 @st.cache_data
@@ -255,16 +314,44 @@ async def check_ean_on_page(session, url, ean):
 
 
 async def fetch_image_bytes(session, url):
-    """Download image bytes with size sanity check."""
-    try:
-        async with session.get(url, headers=HEADERS, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                return {"url": url, "mime": mime, "data": data}
-    except Exception:
-        pass
-    return None
+    """
+    Download image bytes. Retries with rotated User-Agents on 403/429 (anti-bot blocks).
+    Returns dict on success, or dict with "error" key explaining the failure.
+    """
+    last_status = None
+    last_error = None
+
+    for attempt, ua in enumerate(USER_AGENTS):
+        headers = {
+            "User-Agent": ua,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+        }
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                last_status = resp.status
+                if resp.status == 200:
+                    data = await resp.read()
+                    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    return {"url": url, "mime": mime, "data": data}
+                if resp.status in (403, 429) and attempt < len(USER_AGENTS) - 1:
+                    # Anti-bot block - try next User-Agent
+                    continue
+                # Other status (404, 500 etc) - no point retrying
+                return {"error": f"HTTP {resp.status}"}
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            if attempt < len(USER_AGENTS) - 1:
+                continue
+        except Exception as e:
+            last_error = str(e)[:80]
+            if attempt < len(USER_AGENTS) - 1:
+                continue
+
+    if last_status:
+        return {"error": f"HTTP {last_status} after {len(USER_AGENTS)} UA retries"}
+    return {"error": f"Network error: {last_error}"}
 
 
 def inspect_image(data: bytes):
@@ -330,17 +417,22 @@ async def evaluate_candidate(session, source, url, diag):
     """
     Try to download + inspect a candidate image.
     Returns dict {url, mime, data, source, inspection, phash} on success, None otherwise.
-    Logs the outcome to diagnostics either way.
+    Logs the SPECIFIC reason for any rejection.
     """
-    if not _is_valid_image_url(url):
-        diag.log_candidate(source, url, "rejected_url", "URL pattern blacklist hit")
+    # Stage 1: URL check (now returns the matched pattern for diagnostics)
+    is_valid, reject_reason = _check_url(url)
+    if not is_valid:
+        diag.log_candidate(source, url, "rejected_url", reject_reason)
         return None
 
+    # Stage 2: Download (with UA rotation on anti-bot blocks)
     payload = await fetch_image_bytes(session, url)
-    if not payload:
-        diag.log_candidate(source, url, "rejected_download", "HTTP fetch failed or non-200")
+    if not payload or "error" in payload:
+        err = payload.get("error", "unknown") if payload else "no response"
+        diag.log_candidate(source, url, "rejected_download", err)
         return None
 
+    # Stage 3: PIL inspection (size, aspect, readability)
     inspection = inspect_image(payload["data"])
     if not inspection["ok"]:
         diag.log_candidate(source, url, "rejected_dimensions", inspection["reason"],
@@ -439,17 +531,28 @@ def select_images(candidates, diag):
 # ============================================================================
 
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
-    """Retrieves exact product name AND runs the new structured image pipeline."""
+    """
+    Retrieves product name AND runs the structured image pipeline.
+    NEW IN THIS VERSION:
+    - Validates EAN-Search responses, discards garbage placeholders
+    - Always pursues retailer URLs (Goldmine -> Global) regardless of name source
+    - Adds product-name-based SerpAPI search (works when EAN is not indexed)
+    - Adds hail-mary generic image search as final fallback
+    - Always runs JSON-LD scraping when ANY retailer URL exists
+    """
     gl = market_code.lower()
     market_upper = market_code.upper()
     diag = ImageDiagnostics(ean)
 
     product_name = None
     retailer_urls = []
-    candidate_image_urls = []  # list of (source_tag, url)
+    candidate_image_urls = []
     registry_image_url = None
+    serp_url = "https://serpapi.com/search"
 
-    # ATTEMPT 1: EAN-Search API
+    # ========== STAGE 1: GET PRODUCT NAME ==========
+
+    # ATTEMPT 1: EAN-Search API (with garbage detection)
     if ean_token:
         diag.log("🔍 Attempt 1: EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
@@ -458,86 +561,91 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                 if resp.status == 200:
                     data = await resp.json()
                     if data and len(data) > 0 and "error" not in data[0]:
-                        product_name = data[0].get("name")
+                        candidate_name = data[0].get("name", "")
                         registry_image_url = data[0].get("image")
-                        diag.log(f"✅ Found Name via EAN-Search: {product_name}")
+                        if is_garbage_name(candidate_name):
+                            diag.log(f"⚠️ EAN-Search returned placeholder/garbage: '{candidate_name}' - discarding")
+                        else:
+                            product_name = candidate_name
+                            diag.log(f"✅ Found Name via EAN-Search: {product_name}")
         except Exception as e:
             diag.log(f"⚠️ EAN-Search failed: {e}")
 
-    # ATTEMPT 2: SerpAPI Text Search (Goldmine + Generic)
-    if not product_name and serp_key:
-        diag.log("🔍 Attempt 2: Goldmine Google Search for Name...")
-        serp_url = "https://serpapi.com/search"
+    # ATTEMPT 2: SerpAPI Goldmine search (also gives us retailer URLs)
+    if serp_key:
+        diag.log("🔍 Attempt 2: Goldmine Google Search...")
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
-
         try:
             async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
                 organic = data.get("organic_results", [])
                 if organic:
-                    product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    diag.log(f"✅ Found Name via Goldmine: {product_name}")
-                    retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
+                    if not product_name:
+                        product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                        diag.log(f"✅ Found Name via Goldmine: {product_name}")
+                    retailer_urls.extend([res.get("link") for res in organic[:4] if "link" in res])
                 else:
-                    diag.log("⚠️ Goldmine failed, falling back to global bare GTIN search...")
-                    async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
-                        data2 = await resp2.json()
-                        organic2 = data2.get("organic_results", [])
-                        if organic2:
-                            product_name = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                            diag.log(f"✅ Found Name via Global Search: {product_name}")
-                            retailer_urls = [res.get("link") for res in organic2[:4] if "link" in res]
+                    diag.log("⚠️ Goldmine returned no results.")
         except Exception as e:
-            diag.log(f"⚠️ Google text search failed: {e}")
-    elif product_name and serp_key:
-        # We got name from EAN-Search, but still need retailer URLs for image scraping
-        diag.log("🔍 Searching Goldmine for retailer URLs (name already known)...")
-        serp_url = "https://serpapi.com/search"
-        goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
+            diag.log(f"⚠️ Goldmine search failed: {e}")
+
+    # ATTEMPT 3: Global bare GTIN search (always run if we have no retailer URLs OR no name)
+    if serp_key and (not retailer_urls or not product_name):
+        diag.log("🔍 Attempt 3: Global bare GTIN search for retailer URLs...")
         try:
-            async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
+            async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
                 data = await resp.json()
                 organic = data.get("organic_results", [])
                 if organic:
-                    retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
-        except Exception:
-            pass
+                    if not product_name:
+                        product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                        diag.log(f"✅ Found Name via Global Search: {product_name}")
+                    new_urls = [res.get("link") for res in organic[:5] if "link" in res]
+                    # Append unique URLs
+                    for u in new_urls:
+                        if u not in retailer_urls:
+                            retailer_urls.append(u)
+                    diag.log(f"   Collected {len(new_urls)} additional retailer URLs from global search.")
+        except Exception as e:
+            diag.log(f"⚠️ Global search failed: {e}")
 
     if not product_name:
-        diag.log("⚠️ Name not found via databases. Relying entirely on Gemini...")
+        diag.log("⚠️ Name not found anywhere. Relying entirely on Gemini...")
         product_name = f"Product with EAN {ean}"
 
-    # --- EAN-ON-PAGE CONSISTENCY CHECK ---
-    # Cheap safety net: verify the EAN actually appears on the retailer pages we're trusting.
+    # ========== STAGE 2: EAN VERIFICATION ==========
+
     ean_consistency = {"checked": 0, "confirmed": 0, "urls_with_ean": []}
     if retailer_urls:
-        diag.log("🔎 Verifying EAN appears on retailer pages...")
-        check_tasks = [check_ean_on_page(session, url, ean) for url in retailer_urls[:3]]
+        diag.log(f"🔎 Verifying EAN appears on {min(len(retailer_urls), 4)} retailer pages...")
+        check_tasks = [check_ean_on_page(session, url, ean) for url in retailer_urls[:4]]
         check_results = await asyncio.gather(*check_tasks, return_exceptions=True)
-        for url, result in zip(retailer_urls[:3], check_results):
+        for url, result in zip(retailer_urls[:4], check_results):
             ean_consistency["checked"] += 1
             if result is True:
                 ean_consistency["confirmed"] += 1
                 ean_consistency["urls_with_ean"].append(url)
         diag.log(f"   EAN confirmed on {ean_consistency['confirmed']}/{ean_consistency['checked']} retailer pages")
 
-    # --- GATHERING CANDIDATE IMAGES ---
+    # ========== STAGE 3: GATHER CANDIDATE IMAGES ==========
 
-    # 1. Scrape JSON-LD + OG + Twitter from retailer pages (MAJOR UPGRADE)
+    # Source 1: ALWAYS scrape JSON-LD + OG + Twitter from any retailer URLs we have
     if retailer_urls:
-        diag.log("🌐 Scraping JSON-LD + OG + Twitter images from retailer pages...")
-        scrape_tasks = [extract_product_images_from_page(session, url) for url in retailer_urls]
+        diag.log(f"🌐 Scraping JSON-LD + OG + Twitter images from {len(retailer_urls)} retailer pages...")
+        scrape_tasks = [extract_product_images_from_page(session, url) for url in retailer_urls[:5]]
         per_page_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+        scraped_count = 0
         for result in per_page_results:
             if isinstance(result, Exception):
                 continue
             for source_tag, img_url in result:
                 candidate_image_urls.append((source_tag, img_url))
+                scraped_count += 1
+        diag.log(f"   Scraped {scraped_count} image URLs from retailer pages.")
 
-    # 2. SerpAPI Image Search
+    # Source 2: SerpAPI image search by EAN (strict)
     if serp_key:
-        diag.log("🖼️ Searching high-res images via Google Images...")
-        serp_url = "https://serpapi.com/search"
+        diag.log("🖼️ SerpAPI image search by EAN...")
         try:
             r1, r2 = await asyncio.gather(
                 session.get(serp_url, params={"q": f'"{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
@@ -552,9 +660,33 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                         if url:
                             candidate_image_urls.append((tag, url))
         except Exception as e:
-            diag.log(f"⚠️ SerpAPI image search failed: {e}")
+            diag.log(f"⚠️ SerpAPI EAN image search failed: {e}")
 
-    # 3. Registry image as fallback
+    # Source 3 (NEW): SerpAPI image search by PRODUCT NAME
+    # This rescues products whose EAN isn't indexed but whose name IS
+    if serp_key and product_name and not product_name.startswith("Product with EAN"):
+        diag.log("🖼️ SerpAPI image search by product name...")
+        # Trim to first ~6 words to avoid overspecific queries
+        name_query = " ".join(product_name.split()[:8])
+        try:
+            async with session.get(
+                serp_url,
+                params={"q": name_query, "tbm": "isch", "gl": gl, "api_key": serp_key},
+                timeout=10
+            ) as resp:
+                if resp.status == 200:
+                    img_data = await resp.json()
+                    name_hits = 0
+                    for item in img_data.get("images_results", [])[:8]:
+                        url = item.get("original", "")
+                        if url:
+                            candidate_image_urls.append(("serpapi_name", url))
+                            name_hits += 1
+                    diag.log(f"   Found {name_hits} candidates by name search.")
+        except Exception as e:
+            diag.log(f"⚠️ SerpAPI name image search failed: {e}")
+
+    # Source 4: EAN-Search registry image
     if registry_image_url:
         candidate_image_urls.append(("ean_search_registry", registry_image_url))
 
@@ -568,15 +700,49 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
 
     diag.log(f"📊 {len(deduped)} unique candidate URLs collected. Evaluating...")
 
-    # --- EVALUATE ALL CANDIDATES (download + PIL inspect + phash) ---
-    # Higher cap (16) to give us more raw material; we filter aggressively after
+    # ========== STAGE 4: EVALUATE CANDIDATES ==========
+
     eval_tasks = [evaluate_candidate(session, src, url, diag) for src, url in deduped[:16]]
     eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
     valid_candidates = [r for r in eval_results if r and not isinstance(r, Exception)]
 
     diag.log(f"✅ {len(valid_candidates)} candidates passed download + quality inspection.")
 
-    # --- SELECT: returns extraction set (for Gemini) + display set (for user) ---
+    # ========== STAGE 5: HAIL MARY (only if we have ZERO viable images) ==========
+
+    if len(valid_candidates) == 0 and serp_key:
+        diag.log("🆘 HAIL MARY: zero viable images - trying generic Google search...")
+        # Generic search: brand + name, no quotes, no site filter
+        if product_name and not product_name.startswith("Product with EAN"):
+            generic_query = product_name
+        else:
+            generic_query = str(ean)
+        try:
+            async with session.get(
+                serp_url,
+                params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key},
+                timeout=10
+            ) as resp:
+                if resp.status == 200:
+                    img_data = await resp.json()
+                    hail_mary_urls = []
+                    for item in img_data.get("images_results", [])[:10]:
+                        url = item.get("original", "")
+                        if url and url not in seen_urls:
+                            hail_mary_urls.append(("serpapi_hailmary", url))
+                            seen_urls.add(url)
+                    diag.log(f"   Hail mary found {len(hail_mary_urls)} new candidates - evaluating...")
+                    if hail_mary_urls:
+                        hail_eval_tasks = [evaluate_candidate(session, src, url, diag) for src, url in hail_mary_urls]
+                        hail_eval_results = await asyncio.gather(*hail_eval_tasks, return_exceptions=True)
+                        hail_valid = [r for r in hail_eval_results if r and not isinstance(r, Exception)]
+                        valid_candidates.extend(hail_valid)
+                        diag.log(f"   Hail mary rescued {len(hail_valid)} viable images.")
+        except Exception as e:
+            diag.log(f"⚠️ Hail mary failed: {e}")
+
+    # ========== STAGE 6: SELECT EXTRACTION + DISPLAY SETS ==========
+
     extraction_set, display_set = select_images(valid_candidates, diag)
     diag.log(f"🎯 Sending {len(extraction_set)} images to Gemini for extraction; displaying top {len(display_set)}.")
 
